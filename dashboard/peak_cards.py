@@ -96,7 +96,8 @@ _DAY_APEX = {
     "chart": {"animations": {"enabled": False}, "parentHeightOffset": 0},
     "grid": {"show": True, "borderColor": "#26282d", "strokeDashArray": 0, "padding": {"left": 8, "right": 8},
              "xaxis": {"lines": {"show": False}}, "yaxis": {"lines": {"show": True}}},
-    "xaxis": {"tickAmount": 6, "labels": {"style": {"colors": "#9aa0a8"}, "datetimeFormatter": {"hour": "h tt"}},
+    "xaxis": {"labels": {"style": {"colors": "#9aa0a8"}, "datetimeUTC": False,
+                                          "datetimeFormatter": {"hour": "h tt"}},
               "axisBorder": {"show": False}, "axisTicks": {"show": False}},
     "legend": {"show": False},
     "tooltip": {"theme": "dark"},
@@ -111,27 +112,31 @@ def _day_chart(kind):
         apex["dataLabels"] = {"style": {"colors": ["#ececec"], "fontSize": "11px"}, "offsetY": -4,
                               "background": {"enabled": False}, "dropShadow": {"enabled": False},
                               "formatter": "EVAL:function(v){ return v > 0 ? v : ''; }"}
-        apex["plotOptions"] = {"bar": {"columnWidth": "70%", "borderRadius": 2}}
         apex["xaxis"] = dict(apex["xaxis"], labels={"show": False})
         series = [{
-            "entity": f"sensor.{P}_total_dabs", "name": "Hits", "type": "column", "color": "#ff7a1a",
+            # stepped histogram rather than apex columns: columns on a time axis get padded on both
+            # sides, which shifts the plot relative to the session chart below it
+            "entity": f"sensor.{P}_total_dabs", "name": "Hits", "type": "area", "curve": "stepline",
+            "color": "#ff7a1a", "opacity": 0.85, "stroke_width": 1, "yaxis_id": "y", "extend_to": "now",
             "group_by": {"func": "diff", "duration": "1h"},
             "show": {"datalabels": True, "legend_value": False},
         }]
-        yaxis = [{"min": 0, "decimals": 0, "apex_config": {"tickAmount": 2, "forceNiceScale": True,
-                                                            "labels": {"minWidth": 24, "style": {"colors": "#6b6f76"}}}}]
+        yaxis = [{"id": "y", "min": 0, "decimals": 0,
+                  "apex_config": {"tickAmount": 2, "forceNiceScale": True,
+                                  "labels": {"minWidth": 28, "maxWidth": 28, "style": {"colors": "#6b6f76"}}}}]
     else:
         apex["chart"]["height"] = 80
         apex["grid"]["yaxis"] = {"lines": {"show": False}}
         series = [{
-            "entity": "binary_sensor.peak_recent_hit", "name": "Session", "type": "area", "curve": "stepline",
+            "entity": "binary_sensor.peak_recent_hit", "name": "Session", "type": "area", "curve": "stepline", "yaxis_id": "y",
             "color": "#c9a24a", "opacity": 0.35, "stroke_width": 1, "extend_to": "now",
             "transform": "return x === 'on' ? 1 : 0;",
             "show": {"legend_value": False, "in_header": False},
         }]
         # same y-label gutter as the bars chart (labels painted in the card colour) so the plots line up
-        yaxis = [{"min": 0, "max": 1, "apex_config": {"tickAmount": 1, "labels": {"minWidth": 24,
-                                                                                 "style": {"colors": "#15161a"}}}}]
+        yaxis = [{"id": "y", "min": 0, "max": 1,
+                  "apex_config": {"tickAmount": 1, "labels": {"minWidth": 28, "maxWidth": 28,
+                                                              "style": {"colors": "#15161a"}}}}]
     return dict(_DAY_AXIS, type="custom:apexcharts-card", apex_config=apex, yaxis=yaxis, series=series,
                 grid_options={"columns": "full"})
 
