@@ -118,6 +118,15 @@ globals:
   - id: ui_anim            # true while something on screen is still easing
     type: bool
     initial_value: 'false'
+  - id: preset_sel         # presets page highlight: 0 none, 1-4 profiles, 5 boost
+    type: int
+    initial_value: '0'
+  - id: temp_ref           # [wake] heater temp reference for the rise detector
+    type: float
+    initial_value: 'NAN'
+  - id: temp_ref_ms
+    type: uint32_t
+    initial_value: '0'
 
 sensor:
   - platform: wifi_signal
@@ -125,6 +134,18 @@ sensor:
   - platform: homeassistant
     id: peak_temp
     entity_id: sensor.peak_pro_02743_heater_temperature
+    on_value:
+      # [wake] a rise of more than 15 °F inside a minute means the rig was started: wake the screen
+      - lambda: |-
+          if (isnan(x)) return;
+          uint32_t now = millis();
+          bool reset = isnan(id(temp_ref)) || id(temp_ref_ms) == 0 || (now - id(temp_ref_ms)) > 60000 || x < id(temp_ref);
+          if (!reset && x - id(temp_ref) > 15.0f) {
+            id(temp_ref) = x; id(temp_ref_ms) = now;
+            id(user_activity).execute();
+            return;
+          }
+          if (reset) { id(temp_ref) = x; id(temp_ref_ms) = now; }
   - platform: homeassistant
     id: peak_batt
     entity_id: sensor.peak_pro_02743_battery
@@ -170,22 +191,36 @@ sensor:
     internal: true
     on_clockwise:
       - script.execute: user_activity
-      - lambda: |-
-          int cur = id(picking) ? id(pending_profile) : atoi(id(peak_profile).state.c_str());
-          if (cur < 1 || cur > 4) cur = 1;
-          id(pending_profile) = cur % 4 + 1;
-          id(picking) = true;
-      - component.update: lcd
-      - script.execute: commit_profile
+      - if:
+          condition:
+            lambda: 'return id(page) == 2;'
+          then:
+            - lambda: 'id(preset_sel) = id(preset_sel) % 5 + 1;'
+            - component.update: lcd
+          else:
+            - lambda: |-
+                int cur = id(picking) ? id(pending_profile) : atoi(id(peak_profile).state.c_str());
+                if (cur < 1 || cur > 4) cur = 1;
+                id(pending_profile) = cur % 4 + 1;
+                id(picking) = true;
+            - component.update: lcd
+            - script.execute: commit_profile
     on_anticlockwise:
       - script.execute: user_activity
-      - lambda: |-
-          int cur = id(picking) ? id(pending_profile) : atoi(id(peak_profile).state.c_str());
-          if (cur < 1 || cur > 4) cur = 1;
-          id(pending_profile) = (cur + 2) % 4 + 1;
-          id(picking) = true;
-      - component.update: lcd
-      - script.execute: commit_profile
+      - if:
+          condition:
+            lambda: 'return id(page) == 2;'
+          then:
+            - lambda: 'id(preset_sel) = id(preset_sel) <= 1 ? 5 : id(preset_sel) - 1;'
+            - component.update: lcd
+          else:
+            - lambda: |-
+                int cur = id(picking) ? id(pending_profile) : atoi(id(peak_profile).state.c_str());
+                if (cur < 1 || cur > 4) cur = 1;
+                id(pending_profile) = (cur + 2) % 4 + 1;
+                id(picking) = true;
+            - component.update: lcd
+            - script.execute: commit_profile
 script:
   - id: commit_profile
     mode: restart
@@ -225,19 +260,17 @@ select:
     name: Gauge Style
     icon: mdi:gauge
     options:
-      - Ring
       - Race Tach
       - Ferrari
       - Porsche
-      - Minimal
-      - Segments
-      - Twin
-      - Color Test
-    initial_option: Ring
+      - Fuel & Temp
+      - Session
+      - Thermo
+    initial_option: Race Tach
     optimistic: true
     restore_value: true
     on_value:
-      - lambda: 'if (i >= 1 && i <= 3) id(tach_sweep_ms) = millis();'
+      - lambda: 'if (i <= 2) id(tach_sweep_ms) = millis();'
       - component.update: lcd
 
 binary_sensor:
@@ -250,6 +283,8 @@ binary_sensor:
           id(ready_armed) = true;
           id(heat_start_ms) = millis();
           id(last_remaining) = NAN;
+      # [wake] starting the rig wakes the remote
+      - script.execute: user_activity
     on_release:
       - lambda: |-
           id(ready_armed) = false;
@@ -271,7 +306,31 @@ binary_sensor:
       - min_length: 20ms
         max_length: 600ms
         then:
-          - lambda: 'id(page) = (id(page) + 1) % 2;'
+          - if:
+              condition:
+                lambda: 'return id(page) == 2 && id(preset_sel) >= 1 && id(preset_sel) <= 4;'
+              then:
+                - homeassistant.action:
+                    action: select.select_option
+                    data:
+                      entity_id: select.peak_pro_02743_active_profile
+                    data_template:
+                      option: "{{ opt }}"
+                    variables:
+                      opt: 'return to_string(id(preset_sel));'
+                - lambda: 'id(page) = 0; id(preset_sel) = 0;'
+              else:
+                - if:
+                    condition:
+                      lambda: 'return id(page) == 2 && id(preset_sel) == 5;'
+                    then:
+                      - homeassistant.action:
+                          action: button.press
+                          data:
+                            entity_id: button.peak_pro_02743_boost_session
+                      - lambda: 'id(page) = 0; id(preset_sel) = 0;'
+                    else:
+                      - lambda: 'id(page) = (id(page) + 1) % 3; id(preset_sel) = 0;'
           - component.update: lcd
       - min_length: 1500ms
         max_length: 5000ms
@@ -285,6 +344,23 @@ text_sensor:
   - platform: homeassistant
     id: peak_profile
     entity_id: select.peak_pro_02743_active_profile
+  # [presets] profile LED colours, "[r, g, b]" strings parsed at draw time
+  - platform: homeassistant
+    id: pc1
+    entity_id: light.peak_pro_02743_profile_1_color
+    attribute: rgb_color
+  - platform: homeassistant
+    id: pc2
+    entity_id: light.peak_pro_02743_profile_2_color
+    attribute: rgb_color
+  - platform: homeassistant
+    id: pc3
+    entity_id: light.peak_pro_02743_profile_3_color
+    attribute: rgb_color
+  - platform: homeassistant
+    id: pc4
+    entity_id: light.peak_pro_02743_profile_4_color
+    attribute: rgb_color
   - platform: homeassistant
     id: p1
     entity_id: text.peak_pro_02743_profile_1_name
@@ -393,7 +469,8 @@ touchscreen:
           uint32_t now = millis();
           if (now - id(last_tap_ms) < 300) return;
           id(last_tap_ms) = now;
-          id(page) = (id(page) + 1) % 2;
+          id(page) = (id(page) + 1) % 3;
+          id(preset_sel) = 0;
       - script.execute: user_activity
       - component.update: lcd
 
@@ -795,14 +872,70 @@ display:
         return;
       }
 
-      // ================= ALTERNATE FACES (Gauge Style select) =================
-      auto ai = id(face).active_index();
-      int style = ai.has_value() ? (int) *ai : 0;
       auto pt = [&](float r, float deg, int &x, int &y) {
         float a = deg * 0.01745329f;
         x = cx + (int) lroundf(r * cosf(a));
         y = cy + (int) lroundf(r * sinf(a));
       };
+      // thick radial line (needles on the Fuel & Temp face)
+      auto nline = [&](float r0, float r1, float deg, float hw, Color col) {
+        float a = deg * 0.01745329f, ca = cosf(a), sa = sinf(a), px = -sa * hw, py = ca * hw;
+        int x0 = cx + (int) lroundf(r0 * ca), y0 = cy + (int) lroundf(r0 * sa);
+        int x1 = cx + (int) lroundf(r1 * ca), y1 = cy + (int) lroundf(r1 * sa);
+        int ox = (int) lroundf(px), oy = (int) lroundf(py);
+        it.filled_triangle(x0 + ox, y0 + oy, x0 - ox, y0 - oy, x1 + ox, y1 + oy, col);
+        it.filled_triangle(x0 - ox, y0 - oy, x1 - ox, y1 - oy, x1 + ox, y1 + oy, col);
+      };
+      // profile LED colour from HA's "[r, g, b]" attribute string, grey when unknown
+      auto pcol = [&](int n) -> Color {
+        const std::string &str = n == 1 ? id(pc1).state : n == 2 ? id(pc2).state : n == 3 ? id(pc3).state : id(pc4).state;
+        int v[3] = {0, 0, 0}, k = 0;
+        for (const char *q = str.c_str(); *q && k < 3;) {
+          if (*q >= '0' && *q <= '9') { v[k++] = atoi(q); while (*q >= '0' && *q <= '9') q++; }
+          else q++;
+        }
+        if (k < 3 || (v[0] + v[1] + v[2]) < 30) return id(c_mid);
+        return Color(v[0], v[1], v[2]);
+      };
+
+      // ================= PRESETS (page 2) =================
+      if (id(page) == 2) {
+        int sel = id(preset_sel);
+        const float QA[4] = {-180.0f, -90.0f, 0.0f, 90.0f};  // TL, TR, BR, BL quadrants
+        for (int n = 1; n <= 4; n++) {
+          float qa0 = QA[n - 1], qa1 = qa0 + 90.0f;
+          bool hi = sel == n;
+          arc(105.0f, 110.0f, qa0 + 3.0f, qa1 - 3.0f, pcol(n), Color::BLACK);
+          if (hi) arc(98.0f, 101.0f, qa0 + 3.0f, qa1 - 3.0f, id(c_heat), Color::BLACK);
+          int px, py;
+          pt(68.0f, qa0 + 45.0f, px, py);
+          std::string nm = pname(n);
+          size_t sp = nm.find(' ');
+          Color tc = hi ? id(c_fg) : (n == cur ? id(c_fg) : id(c_mid));
+          if (sp == std::string::npos) {
+            it.print(px, py - 6, id(f_label), tc, TextAlign::CENTER, nm.c_str());
+          } else {
+            it.print(px, py - 12, id(f_label), tc, TextAlign::CENTER, nm.substr(0, sp).c_str());
+            it.print(px, py + 2, id(f_label), tc, TextAlign::CENTER, nm.substr(sp + 1).c_str());
+          }
+          float t = ptemp(n);
+          if (!isnan(t)) it.printf(px, py + 20, id(f_body), hi ? id(c_heat) : id(c_dim), TextAlign::CENTER, "%d°", (int) lroundf(t));
+        }
+        it.line(cx, 12, cx, cy - 34, id(c_seg));
+        it.line(cx, cy + 34, cx, 228, id(c_seg));
+        it.line(12, cy, cx - 34, cy, id(c_seg));
+        it.line(cx + 34, cy, 228, cy, id(c_seg));
+        bool bh = sel == 5;
+        it.filled_circle(cx, cy, 30, Color(20, 20, 20));
+        it.circle(cx, cy, 30, bh ? id(c_heat) : id(c_seg));
+        if (bh) it.circle(cx, cy, 29, id(c_heat));
+        it.print(cx, cy, id(f_body), bh ? id(c_heat) : id(c_fg), TextAlign::CENTER, "Boost", Color(20, 20, 20));
+        return;
+      }
+
+      // ================= FACES (Gauge Style select) =================
+      auto ai = id(face).active_index();
+      int style = ai.has_value() ? (int) *ai : 0;
       auto status = [&]() -> const char * {
         if (!hasT) return "Not connected";
         if (holding) return "Ready";
@@ -885,13 +1018,13 @@ display:
         bgc = Color::BLACK;
       };
 
-      if (style == 1) {
+      if (style == 0) {
         // RACE TACH: black face, orange needle, red band, shift lights
         tach({Color::BLACK, Color(42, 44, 48), id(c_mid), id(c_fg), id(c_fg), id(c_bad), id(c_bad), id(c_heat),
               Color::BLACK, Color(58, 61, 68), id(c_dim), Color::BLACK, id(c_fg), Color(58, 61, 68), true, true});
         return;
       }
-      if (style == 2) {
+      if (style == 1) {
         // FERRARI: Giallo face, black numerals and ticks, red needle and redline, shift lights
         const Color giallo(255, 158, 0), rosso(220, 20, 28);  // panel is green-heavy; this reads as Giallo
         tach({giallo, Color(20, 20, 20), Color(30, 30, 30), Color::BLACK, Color::BLACK, rosso, rosso, rosso,
@@ -899,7 +1032,7 @@ display:
               Color(16, 16, 16), true, true});
         return;
       }
-      if (style == 3) {
+      if (style == 2) {
         // PORSCHE: matte black, pale green numerals, white needle, red redline ticks, silver bezel
         const Color lume(206, 226, 196), silver(150, 154, 160), red(214, 40, 40);
         tach({Color(6, 6, 6), silver, Color(170, 172, 168), Color(236, 236, 230), lume, red, red, Color(242, 242, 236),
@@ -908,98 +1041,103 @@ display:
         return;
       }
 
-      if (style == 7) {
-        // ---------- COLOR TEST: labelled swatches for calibrating this panel by eye ----------
-        struct Sw { const char *k; uint8_t r, g, b; };
-        static const Sw sw[] = {
-          {"A", 255, 255, 0},  {"B", 255, 220, 0},  {"C", 255, 190, 0},  {"D", 255, 158, 0},
-          {"E", 255, 120, 0},  {"F", 255, 0, 0},    {"G", 220, 20, 28},  {"H", 0, 255, 0},
-          {"I", 0, 0, 255},    {"J", 255, 255, 255},{"K", 160, 160, 160},{"L", 255, 122, 26},
-        };
-        const int cols = 4, w = 40, h = 34, gx = 4, gy = 6;
-        int x0 = cx - (cols * w + (cols - 1) * gx) / 2, y0 = 52;
-        for (int i = 0; i < 12; i++) {
-          int x = x0 + (i % cols) * (w + gx), y = y0 + (i / cols) * (h + gy);
-          Color c(sw[i].r, sw[i].g, sw[i].b);
-          it.filled_rectangle(x, y, w, h, c);
-          bool dark = (sw[i].r * 3 + sw[i].g * 6 + sw[i].b) / 10 > 150;
-          it.print(x + w / 2, y + h / 2, id(f_body), dark ? Color::BLACK : Color::WHITE, TextAlign::CENTER, sw[i].k, c);
-        }
-        it.print(cx, 186, id(f_label), id(c_mid), TextAlign::CENTER, "Which yellow looks right?");
-        return;
-      }
+      const Color rosso2(220, 20, 28), gold(214, 150, 54);  // reds/golds biased red for this panel
 
-      if (style == 4) {
-        // ---------- MINIMAL: numerals and one hairline ----------
-        arc(112.0f, 114.5f, 0.0f, 360.0f, id(c_track), Color::BLACK);
-        if (P > 0.001f) arc(112.0f, 114.5f, 270.0f, 270.0f + 360.0f * P, heating ? id(c_heat) : id(c_idle_fill), id(c_track));
-        temp_text(Td, 138, id(f_temp), 51, id(f_body), 12, (awake || heating) ? id(c_fg) : id(c_mid), id(c_mid));
-        if (heating) it.print(cx, 166, id(f_label), id(c_heat), TextAlign::CENTER, status());
-        else if (cur) fit(166, id(f_label), id(f_label), id(c_dim), pname(cur).c_str(), 160);
+      if (style == 3) {
+        // ---------- FUEL & TEMP: aviation twin needle ----------
+        // left arc = battery as fuel (E bottom-left 135°, F top-left 225°); right arc = heater 0-7 (0 at 45°, 7 at -45°)
+        arc(98.0f, 101.0f, 135.0f, 225.0f, id(c_seg), Color::BLACK);
+        ticks(93.0f, 101.0f, 89.0f, 135.0f, 11.25f, 9, 4, 1.4f, id(c_tick), id(c_tick_major));
+        arc(96.0f, 102.0f, 135.0f, 148.0f, rosso2, Color::BLACK);   // reserve under ~15 %
+        it.print(38, 182, id(f_label), id(c_mid), TextAlign::CENTER, "E");
+        it.print(38, 58, id(f_label), id(c_mid), TextAlign::CENTER, "F");
+        arc(98.0f, 101.0f, -45.0f, 45.0f, id(c_seg), Color::BLACK);
+        ticks(93.0f, 101.0f, 89.0f, -45.0f, 90.0f / 14.0f, 15, 2, 1.4f, id(c_tick), id(c_tick_major));
+        float ra = 45.0f - 90.0f * fminf(fmaxf(tgt_eff, 0.0f), 700.0f) / 700.0f;
+        arc(96.0f, 102.0f, -45.0f, ra, rosso2, Color::BLACK);          // redline: target and above
+        it.print(202, 182, id(f_label), id(c_mid), TextAlign::CENTER, "0");
+        it.print(202, 58, id(f_label), id(c_mid), TextAlign::CENTER, "7");
+        if (!isnan(batt)) nline(60.0f, 96.0f, 135.0f + 90.0f * fminf(fmaxf(batt, 0.0f), 100.0f) / 100.0f, 1.5f, id(c_fg));
+        if (hasT) nline(60.0f, 96.0f, 45.0f - 90.0f * fminf(fmaxf(Td, 0.0f), 700.0f) / 700.0f, 1.5f, heating ? id(c_heat) : id(c_fg));
+        it.print(cx, 26, id(f_label), id(c_dim), TextAlign::CENTER, "Fuel  ·  Temp");
+        it.image(cx, 36, id(mark), ImageAlign::TOP_CENTER, id(c_mid), Color::BLACK);
+        const Color win(14, 14, 14);
+        it.filled_rectangle(68, 86, 104, 46, win);
+        it.rectangle(68, 86, 104, 46, id(c_seg));
+        if (hasT) it.printf(cx, 109, id(f_num), heating ? id(c_heat) : id(c_fg), TextAlign::CENTER, "%d", (int) lroundf(Td), win);
+        else it.print(cx, 109, id(f_num), id(c_mid), TextAlign::CENTER, "--", win);
+        it.print(cx, 141, id(f_label), id(c_dim), TextAlign::CENTER, "°F  heater");
+        it.filled_rectangle(86, 150, 68, 24, win);
+        it.rectangle(86, 150, 68, 24, id(c_seg));
+        if (!isnan(batt)) it.printf(cx, 162, id(f_body), id(c_fg), TextAlign::CENTER, "%d %%", (int) lroundf(batt), win);
+        if (cur) fit(198, id(f_label), id(f_label), id(c_mid), pname(cur).c_str(), 150);
+        char sb[28];
+        if (heating && !isnan(rem)) snprintf(sb, sizeof(sb), "%d s left", (int) lroundf(fmaxf(rem, 0.0f)));
+        else if (heating) snprintf(sb, sizeof(sb), "Heating");
+        else spec(cur, sb, sizeof(sb));
+        if (sb[0]) it.print(cx, 216, id(f_label), heating ? id(c_heat) : id(c_dim), TextAlign::CENTER, sb);
         return;
       }
 
       if (style == 5) {
-        // ---------- SEGMENTS: LED meter ----------
-        const int NS = 30;
-        const float span = SWEEP / NS, gap = 2.4f;
-        int on = (int) lroundf(P * NS);
-        for (int i = 0; i < NS; i++) {
-          float a0 = A0 + i * span + gap * 0.5f, a1 = A0 + (i + 1) * span - gap * 0.5f;
-          Color c = id(c_track);
-          if (i < on) c = heating ? mix(id(c_warn), id(c_heat), (float) i / NS) : id(c_idle_fill);
-          arc(96.0f, 112.0f, a0, a1, c, Color::BLACK);
+        // ---------- THERMO: vertical fluted bar ----------
+        const int x0 = 104, x1 = 136, y0 = 34, y1 = 196;
+        it.filled_rectangle(x0, y0, x1 - x0, y1 - y0, id(c_track));
+        it.rectangle(x0, y0, x1 - x0, y1 - y0, id(c_seg));
+        for (int i = 1; i < 4; i++) it.line(x0 + 8 * i, y0 + 6, x0 + 8 * i, y1 - 6, Color(12, 12, 12));
+        if (hasT) {
+          float tv = fminf(fmaxf(Td, 0.0f), 700.0f);
+          int fy = y1 - (int) lroundf((y1 - y0) * tv / 700.0f);
+          if (fy < y0 + 4) fy = y0 + 4;
+          int fh = (y1 - 4) - fy;
+          if (fh > 0) it.filled_rectangle(x0 + 4, fy, x1 - x0 - 8, fh, heating ? rosso2 : id(c_idle_fill));
         }
-        battery(100.0f, 106.0f, 1.0f);
-        it.print(cx, 62, id(f_label), heating ? id(c_heat) : id(c_dim), TextAlign::CENTER, status());
-        temp_text(Td, 136, id(f_temp), 51, id(f_body), 12, (awake || heating) ? id(c_fg) : id(c_mid), id(c_mid));
-        if (cur) fit(164, id(f_body), id(f_label), id(c_mid), pname(cur).c_str(), 160);
-        batt_text(192, id(c_dim));
+        int ty = y1 - (int) lroundf((y1 - y0) * fminf(tgt_eff, 700.0f) / 700.0f);
+        it.horizontal_line(x0 - 10, ty, x1 - x0 + 20, gold);
+        it.horizontal_line(x0 - 10, ty + 1, x1 - x0 + 20, gold);
+        if (!isnan(tgt)) it.printf(x1 + 16, ty, id(f_label), gold, TextAlign::CENTER_LEFT, "%d", (int) lroundf(tgt));
+        for (int v = 0; v <= 600; v += 200) {
+          int yy = y1 - (int) lroundf((y1 - y0) * v / 700.0f);
+          it.horizontal_line(x0 - 6, yy, 4, id(c_tick_major));
+          it.printf(x0 - 10, yy, id(f_label), id(c_dim), TextAlign::CENTER_RIGHT, "%d", v);
+        }
+        if (hasT) it.printf(52, 100, id(f_num), heating ? id(c_heat) : id(c_fg), TextAlign::CENTER, "%d", (int) lroundf(Td));
+        else it.print(52, 100, id(f_num), id(c_mid), TextAlign::CENTER, "--");
+        it.print(52, 126, id(f_label), id(c_dim), TextAlign::CENTER, "°F");
+        char sb[40];
+        if (heating && !isnan(rem)) snprintf(sb, sizeof(sb), "%s · %d s", holding ? "Ready" : "Heating", (int) lroundf(fmaxf(rem, 0.0f)));
+        else if (heating) snprintf(sb, sizeof(sb), "Heating");
+        else if (cur) snprintf(sb, sizeof(sb), "%s · %s", status(), pname(cur).c_str());
+        else snprintf(sb, sizeof(sb), "%s", status());
+        fit(214, id(f_label), id(f_label), heating ? id(c_heat) : id(c_mid), sb, 200);
+        batt_text(196, id(c_dim));
+        it.image(cx, 8, id(mark), ImageAlign::TOP_CENTER, id(c_mid), Color::BLACK);
         return;
       }
 
-      if (style == 6) {
-        // ---------- TWIN: heat on the left, battery on the right ----------
-        const float TL0 = 125.0f, TL1 = 235.0f;          // left arc, bottom -> top
-        const float BR0 = 305.0f, BR1 = 415.0f;          // right arc, top -> bottom
-        arc(100.0f, 110.0f, TL0, TL1, id(c_track), Color::BLACK);
-        arc(100.0f, 110.0f, BR0, BR1, id(c_track), Color::BLACK);
-        if (P > 0.001f) arc(100.0f, 110.0f, TL0, TL0 + (TL1 - TL0) * P, heating ? id(c_heat) : id(c_idle_fill), id(c_track));
-        if (!isnan(batt) && batt > 0.0f) {
-          float bf = fminf(batt, 100.0f) / 100.0f;
-          arc(100.0f, 110.0f, BR1 - (BR1 - BR0) * bf, BR1, batt_col(batt), id(c_track));
-        }
-        it.print(66, 206, id(f_label), heating ? id(c_heat) : id(c_dim), TextAlign::CENTER, "Heat");
-        if (!isnan(batt)) it.printf(174, 206, id(f_label), id(c_dim), TextAlign::CENTER, "%d%%", (int) lroundf(batt));
-        it.print(cx, 62, id(f_label), heating ? id(c_heat) : id(c_dim), TextAlign::CENTER, status());
-        temp_text(Td, 136, id(f_temp), 51, id(f_body), 12, (awake || heating) ? id(c_fg) : id(c_mid), id(c_mid));
-        if (cur) fit(164, id(f_body), id(f_label), id(c_mid), pname(cur).c_str(), 150);
-        return;
-      }
-
-      // ================= MAIN (idle / heating / holding) =================
-      dial_ticks(id(c_tick), id(c_tick_major));
-      arc(R_IN, R_OUT, A0, A0 + SWEEP, id(c_track), Color::BLACK);
-      if (P > 0.001f) {
-        float a1 = A0 + SWEEP * P;
-        arc(R_IN, R_OUT, A0, a1, heating ? id(c_heat) : id(c_idle_fill), id(c_track));
-        if (heating) arc(R_IN, R_OUT, a1 - 1.6f, a1, id(c_fg), id(c_heat));  // fine needle at the leading edge
-      }
-      battery(R_IN, R_OUT, 1.0f);
-
-      if (heating) it.print(cx, 52, id(f_label), id(c_heat), TextAlign::CENTER, holding ? "Ready" : "Heating");
-      else it.image(cx, 40, id(mark), ImageAlign::TOP_CENTER, awake ? id(c_mid) : id(c_dim), Color::BLACK);
-
-      temp_text(Td, 130, id(f_temp), 51, id(f_body), 12, (awake || heating) ? id(c_fg) : id(c_mid), id(c_mid));
-
-      if (!hasT) {
-        it.print(cx, 157, id(f_body), id(c_mid), TextAlign::CENTER, "Not connected");
+      // ---------- SESSION (style 4, and the fallback): countdown first ----------
+      arc(101.0f, 111.0f, 0.0f, 360.0f, id(c_track), Color::BLACK);
+      if (cur) fit(40, id(f_label), id(f_label), id(c_mid), pname(cur).c_str(), 170);
+      it.image(cx, 48, id(mark), ImageAlign::TOP_CENTER, id(c_mid), Color::BLACK);
+      if (heating && holding && timed) {
+        float left = fmaxf(rem, 0.0f);
+        float sweep = 360.0f * fminf(left / dur, 1.0f);
+        if (sweep > 0.5f) arc(101.0f, 111.0f, -90.0f, -90.0f + sweep, id(c_heat), id(c_track));
+        it.printf(cx, 108, id(f_temp), id(c_fg), TextAlign::CENTER, "%d", (int) lroundf(left));
+        it.print(cx, 150, id(f_label), id(c_mid), TextAlign::CENTER, "seconds left");
+        if (hasT && !isnan(tgt)) it.printf(cx, 176, id(f_label), id(c_heat), TextAlign::CENTER, "%d °F, target %d", (int) lroundf(Td), (int) lroundf(tgt));
+        id(ui_anim) = true;
+      } else if (heating) {
+        if (Ptemp > 0.002f) arc(101.0f, 111.0f, -90.0f, -90.0f + 360.0f * Ptemp, id(c_heat), id(c_track));
+        temp_text(Td, 132, id(f_temp), 51, id(f_body), 12, id(c_fg), id(c_mid));
+        it.print(cx, 150, id(f_label), id(c_heat), TextAlign::CENTER, status());
+        if (!isnan(tgt)) it.printf(cx, 176, id(f_label), id(c_mid), TextAlign::CENTER, "Target %d °F", (int) lroundf(tgt));
+      } else if (!hasT) {
+        it.print(cx, 110, id(f_body), id(c_mid), TextAlign::CENTER, "Not connected");
       } else {
-        if (cur) fit(157, id(f_body), id(f_label), (awake || heating) ? id(c_fg) : id(c_mid), pname(cur).c_str(), 180);
-        char sb[28];
-        if (holding && !isnan(rem)) snprintf(sb, sizeof(sb), "%d s remaining", (int) lroundf(fmaxf(rem, 0.0f)));
-        else if (heating && !isnan(tgt)) snprintf(sb, sizeof(sb), "Target %d°F", (int) lroundf(tgt));
-        else spec(cur, sb, sizeof(sb));
-        if (sb[0]) it.print(cx, 178, id(f_label), id(c_dim), TextAlign::CENTER, sb);
+        if (!isnan(tgt)) it.printf(cx, 104, id(f_temp), awake ? id(c_fg) : id(c_mid), TextAlign::CENTER, "%d", (int) lroundf(tgt));
+        else temp_text(Td, 128, id(f_temp), 51, id(f_body), 12, id(c_mid), id(c_dim));
+        it.print(cx, 146, id(f_label), id(c_mid), TextAlign::CENTER, isnan(tgt) ? "°F heater" : "°F target");
+        it.print(cx, 172, id(f_label), id(c_dim), TextAlign::CENTER, awake ? "Ready in about 45 s" : "Asleep");
       }
-      batt_text(200, id(c_mid));
+      batt_text(206, id(c_dim));
