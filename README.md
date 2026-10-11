@@ -52,6 +52,12 @@ Entity names like `peak_pro_02743` come from the device. Yours will carry your P
 
 The `dashboard/` folder holds the scripts that build the page in the screenshot. `peak_cards.py` builds the view, `patch_peak_into_live.py` validates every template against your instance and pushes it. They expect the Mushroom cards from HACS and a long-lived token in `~/.ha_token`. The rig artwork is made by `dashboard/art/make_peak_rig.py` (it needs the transparent Daybreak product render `daybreak_3q.webp` beside it, which is not redistributed here) and uploaded with `upload_art.py`.
 
+The Session column's day charts need two extras: the `apexcharts-card` plugin from HACS, and a template binary sensor helper named **Peak recent hit** (Settings, Helpers, Template, Binary sensor) with this state, which holds each session on for 20 minutes so hits are visible on an 18-hour axis:
+
+```
+{{ is_state('switch.peak_pro_02743_heat_session','on') or (states.switch.peak_pro_02743_heat_session is not none and (now() - states.switch.peak_pro_02743_heat_session.last_changed) < timedelta(minutes=20)) }}
+```
+
 ### Things that will bite you
 
 - If the integration lands in a `failed_unload` state after a connection timeout, nothing but a Home Assistant restart clears it. Reload and disable both refuse.

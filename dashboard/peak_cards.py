@@ -86,6 +86,56 @@ def rig_section():
 
 # --------------------------------------------------------------------------- 2. session
 
+_DAY_AXIS = {  # shared 6 am -> midnight axis so the two day charts line up
+    "graph_span": "18h",
+    "span": {"start": "day", "offset": "+6h"},
+    "header": {"show": False},
+    "now": {"show": True, "color": "#ff7a1a", "label": ""},
+}
+_DAY_APEX = {
+    "chart": {"animations": {"enabled": False}, "parentHeightOffset": 0},
+    "grid": {"show": True, "borderColor": "#26282d", "strokeDashArray": 0, "padding": {"left": 8, "right": 8},
+             "xaxis": {"lines": {"show": False}}, "yaxis": {"lines": {"show": True}}},
+    "xaxis": {"tickAmount": 6, "labels": {"style": {"colors": "#9aa0a8"}, "datetimeFormatter": {"hour": "h tt"}},
+              "axisBorder": {"show": False}, "axisTicks": {"show": False}},
+    "legend": {"show": False},
+    "tooltip": {"theme": "dark"},
+}
+
+
+def _day_chart(kind):
+    """kind='hits': hits per hour as bars. kind='sessions': 10-min session blocks (binary_sensor.peak_recent_hit)."""
+    apex = {k: (dict(v) if isinstance(v, dict) else v) for k, v in _DAY_APEX.items()}
+    if kind == "hits":
+        apex["chart"]["height"] = 130
+        apex["dataLabels"] = {"style": {"colors": ["#ececec"], "fontSize": "11px"}, "offsetY": -4,
+                              "background": {"enabled": False}, "dropShadow": {"enabled": False},
+                              "formatter": "EVAL:function(v){ return v > 0 ? v : ''; }"}
+        apex["plotOptions"] = {"bar": {"columnWidth": "70%", "borderRadius": 2}}
+        apex["xaxis"] = dict(apex["xaxis"], labels={"show": False})
+        series = [{
+            "entity": f"sensor.{P}_total_dabs", "name": "Hits", "type": "column", "color": "#ff7a1a",
+            "group_by": {"func": "diff", "duration": "1h"},
+            "show": {"datalabels": True, "legend_value": False},
+        }]
+        yaxis = [{"min": 0, "decimals": 0, "apex_config": {"tickAmount": 2, "forceNiceScale": True,
+                                                            "labels": {"minWidth": 24, "style": {"colors": "#6b6f76"}}}}]
+    else:
+        apex["chart"]["height"] = 80
+        apex["grid"]["yaxis"] = {"lines": {"show": False}}
+        series = [{
+            "entity": "binary_sensor.peak_recent_hit", "name": "Session", "type": "area", "curve": "stepline",
+            "color": "#c9a24a", "opacity": 0.35, "stroke_width": 1, "extend_to": "now",
+            "transform": "return x === 'on' ? 1 : 0;",
+            "show": {"legend_value": False, "in_header": False},
+        }]
+        # same y-label gutter as the bars chart (labels painted in the card colour) so the plots line up
+        yaxis = [{"min": 0, "max": 1, "apex_config": {"tickAmount": 1, "labels": {"minWidth": 24,
+                                                                                 "style": {"colors": "#15161a"}}}}]
+    return dict(_DAY_AXIS, type="custom:apexcharts-card", apex_config=apex, yaxis=yaxis, series=series,
+                grid_options={"columns": "full"})
+
+
 def session_section():
     action_btn = lambda name, icon, entity, color: {
         "type": "custom:mushroom-template-card",
@@ -120,27 +170,9 @@ def session_section():
                 "unit": "°F",
                 "grid_options": {"columns": "full"},
             },
-            _heading("Last 12 hours", style="subtitle"),
-            {   # when: every heat session as a bar on a timeline
-                "type": "history-graph",
-                "entities": [{"entity": "binary_sensor.peak_recent_hit", "name": "Hit"}],  # 10-min hold per session
-                "hours_to_show": 12,
-                "grid_options": {"columns": "full"},
-            },
-            {   # how many: hits per hour from the dab counter's hourly delta
-                "type": "custom:mini-graph-card",
-                "name": "Hits per hour",
-                "entities": [{"entity": f"sensor.{P}_total_dabs", "name": "Hits", "color": "#ff7a1a"}],
-                "hours_to_show": 12,
-                "group_by": "hour",
-                "aggregate_func": "delta",
-                "points_per_hour": 1,
-                "decimals": 0,
-                "lower_bound": 0,
-                "show": {"graph": "bar", "points": False, "legend": False, "state": False, "name": True,
-                         "labels": True, "icon": False},
-                "grid_options": {"columns": "full"},
-            },
+            _heading("Today, 6 am to midnight", style="subtitle"),
+            _day_chart("hits"),
+            _day_chart("sessions"),
         ],
     }
 
@@ -387,7 +419,7 @@ def _role(card):
         return "tile"
     if t == "sensor":
         return "sensor"
-    if t in ("history-graph", "custom:mini-graph-card"):
+    if t in ("history-graph", "custom:mini-graph-card", "custom:apexcharts-card"):
         return "tile"
     if t == "custom:mushroom-chips-card":
         return "chips"
