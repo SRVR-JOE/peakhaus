@@ -120,6 +120,27 @@ def session_section():
                 "unit": "°F",
                 "grid_options": {"columns": "full"},
             },
+            _heading("Last 12 hours", style="subtitle"),
+            {   # when: every heat session as a bar on a timeline
+                "type": "history-graph",
+                "entities": [{"entity": "binary_sensor.peak_recent_hit", "name": "Hit"}],  # 10-min hold per session
+                "hours_to_show": 12,
+                "grid_options": {"columns": "full"},
+            },
+            {   # how many: hits per hour from the dab counter's hourly delta
+                "type": "custom:mini-graph-card",
+                "name": "Hits per hour",
+                "entities": [{"entity": f"sensor.{P}_total_dabs", "name": "Hits", "color": "#ff7a1a"}],
+                "hours_to_show": 12,
+                "group_by": "hour",
+                "aggregate_func": "delta",
+                "points_per_hour": 1,
+                "decimals": 0,
+                "lower_bound": 0,
+                "show": {"graph": "bar", "points": False, "legend": False, "state": False, "name": True,
+                         "labels": True, "icon": False},
+                "grid_options": {"columns": "full"},
+            },
         ],
     }
 
@@ -366,6 +387,8 @@ def _role(card):
         return "tile"
     if t == "sensor":
         return "sensor"
+    if t in ("history-graph", "custom:mini-graph-card"):
+        return "tile"
     if t == "custom:mushroom-chips-card":
         return "chips"
     if t == "custom:mushroom-light-card":
