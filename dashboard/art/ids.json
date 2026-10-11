@@ -1,0 +1,14 @@
+{
+  "peak/peak_rig_bg": {
+    "id": "15dab1e5de4da00e50ee27d609173dc6",
+    "sha1": "db338ecc275f5677810a3b044a6d9f9e13925ca1"
+  },
+  "peak/peak_rig_glow": {
+    "id": "5166d91ecd84fb32d1fbb0730ad2f916",
+    "sha1": "03a0c9588e48dfe86127e945f50a22b3bcad8e0e"
+  },
+  "peak/peak_rig_none": {
+    "id": "35eec54d7932887ba33e2f88d637a814",
+    "sha1": "35534665e2c5ec21e67e21d6b88a70d5cb3fdb03"
+  }
+}

@@ -1,0 +1,1005 @@
+# PEAKHAUS — M5Dial remote/display for the Puffco Peak Pro. Talks only to Home Assistant
+# (all values come from `homeassistant` platform entities); the Bluetooth proxy lives in
+# puffco-bridge.yaml (ATOM Lite). `name: puffco-proxy` is kept so existing installs keep their
+# hostname and puffco_bt_proxy_* entity ids — rename it on a fresh install if you like.
+esphome:
+  name: puffco-proxy
+  friendly_name: Puffco Dial  # remote/display only; BLE proxy moved to the ATOM Lite (puffco-bridge)
+  on_boot:
+    - priority: 600
+      then:
+        # [features] seed system clock from the on-board BM8563 RTC so the
+        # idle face has a time even before HA connects.
+        - pcf8563.read_time: rtc
+    - priority: -100
+      then:
+        - delay: 3s
+        - lambda: |-
+            id(show_splash) = false;
+            id(last_touch_ms) = millis();
+            id(tach_sweep_ms) = millis();
+        - component.update: lcd
+
+esp32:
+  board: esp32-s3-devkitc-1
+  variant: esp32s3
+  flash_size: 8MB
+  framework:
+    type: esp-idf
+
+logger:
+  hardware_uart: USB_SERIAL_JTAG
+
+api:
+  encryption:
+    key: !secret puffco_proxy_api_key
+
+ota:
+  - platform: esphome
+
+wifi:
+  ap:
+    ssid: "Puffco-Proxy-Setup"
+
+captive_portal:
+improv_serial:
+
+# M5Dial: GPIO46 holds power when running on battery
+switch:
+  - platform: gpio
+    id: power_hold
+    pin: GPIO46
+    restore_mode: ALWAYS_ON
+    internal: true
+
+globals:
+  - id: page
+    type: int
+    initial_value: '0'
+  - id: tach_sweep_ms
+    type: uint32_t
+    initial_value: '0'
+  - id: show_splash
+    type: bool
+    initial_value: 'true'
+  - id: pending_profile
+    type: int
+    initial_value: '0'
+  - id: picking
+    type: bool
+    initial_value: 'false'
+  # ---- [features] globals read by the UI ----
+  - id: screen_dim          # true = backlight faded to idle level
+    type: bool
+    initial_value: 'false'
+  - id: ready_flash         # true for ~3 s when a heat session hits temp
+    type: bool
+    initial_value: 'false'
+  - id: last_touch_ms       # millis() of last knob/button/touch activity
+    type: uint32_t
+    initial_value: '0'
+  # ---- [features] internal state ----
+  - id: ready_armed         # set on heat start, cleared once ready fires
+    type: bool
+    initial_value: 'false'
+  - id: ready_until_ms
+    type: uint32_t
+    initial_value: '0'
+  - id: heat_start_ms
+    type: uint32_t
+    initial_value: '0'
+  - id: last_remaining      # previous heat_time_remaining sample (fallback detector)
+    type: float
+    initial_value: 'NAN'
+  - id: last_tap_ms         # touch debounce
+    type: uint32_t
+    initial_value: '0'
+  - id: ui_temp            # eased temperature actually drawn
+    type: float
+    initial_value: 'NAN'
+  - id: ui_prog            # eased gauge fill 0..1
+    type: float
+    initial_value: '0'
+  - id: ui_wheel           # profile wheel scroll offset in slots, decays to 0
+    type: float
+    initial_value: '0'
+  - id: ui_wheel_last      # profile the wheel last showed
+    type: int
+    initial_value: '0'
+  - id: ui_last_ms         # time of previous frame
+    type: uint32_t
+    initial_value: '0'
+  - id: ui_ready_ms        # rising edge of ready_flash
+    type: uint32_t
+    initial_value: '0'
+  - id: ui_ready_prev
+    type: bool
+    initial_value: 'false'
+  - id: ui_anim            # true while something on screen is still easing
+    type: bool
+    initial_value: 'false'
+
+sensor:
+  - platform: wifi_signal
+    name: WiFi Signal
+  - platform: homeassistant
+    id: peak_temp
+    entity_id: sensor.peak_pro_02743_heater_temperature
+  - platform: homeassistant
+    id: peak_batt
+    entity_id: sensor.peak_pro_02743_battery
+  - platform: homeassistant
+    id: peak_remaining
+    entity_id: sensor.peak_pro_02743_heat_time_remaining
+  - platform: homeassistant
+    id: peak_dabs
+    entity_id: sensor.peak_pro_02743_total_dabs
+  - platform: homeassistant
+    id: peak_per_day
+    entity_id: sensor.peak_pro_02743_dabs_per_day
+  - platform: homeassistant
+    id: d1
+    entity_id: number.peak_pro_02743_profile_1_duration
+  - platform: homeassistant
+    id: d2
+    entity_id: number.peak_pro_02743_profile_2_duration
+  - platform: homeassistant
+    id: d3
+    entity_id: number.peak_pro_02743_profile_3_duration
+  - platform: homeassistant
+    id: d4
+    entity_id: number.peak_pro_02743_profile_4_duration
+  # [features] profile target temperatures (°C) for ready detection
+  - platform: homeassistant
+    id: t1
+    entity_id: number.peak_pro_02743_profile_1_temperature
+  - platform: homeassistant
+    id: t2
+    entity_id: number.peak_pro_02743_profile_2_temperature
+  - platform: homeassistant
+    id: t3
+    entity_id: number.peak_pro_02743_profile_3_temperature
+  - platform: homeassistant
+    id: t4
+    entity_id: number.peak_pro_02743_profile_4_temperature
+  - platform: rotary_encoder
+    id: knob
+    pin_a: GPIO40
+    pin_b: GPIO41
+    resolution: 1
+    internal: true
+    on_clockwise:
+      - script.execute: user_activity
+      - lambda: |-
+          int cur = id(picking) ? id(pending_profile) : atoi(id(peak_profile).state.c_str());
+          if (cur < 1 || cur > 4) cur = 1;
+          id(pending_profile) = cur % 4 + 1;
+          id(picking) = true;
+      - component.update: lcd
+      - script.execute: commit_profile
+    on_anticlockwise:
+      - script.execute: user_activity
+      - lambda: |-
+          int cur = id(picking) ? id(pending_profile) : atoi(id(peak_profile).state.c_str());
+          if (cur < 1 || cur > 4) cur = 1;
+          id(pending_profile) = (cur + 2) % 4 + 1;
+          id(picking) = true;
+      - component.update: lcd
+      - script.execute: commit_profile
+script:
+  - id: commit_profile
+    mode: restart
+    then:
+      - delay: 1200ms
+      - homeassistant.action:
+          action: select.select_option
+          data:
+            entity_id: select.peak_pro_02743_active_profile
+          data_template:
+            option: "{{ opt }}"
+          variables:
+            opt: 'return to_string(id(pending_profile));'
+      - delay: 1500ms
+      - lambda: 'id(picking) = false;'
+      - component.update: lcd
+
+  # [features] any knob/button/touch input: stamp time, wake screen if dimmed
+  - id: user_activity
+    mode: restart
+    then:
+      - lambda: 'id(last_touch_ms) = millis();'
+      - if:
+          condition:
+            lambda: 'return id(screen_dim);'
+          then:
+            - lambda: 'id(screen_dim) = false;'
+            - light.turn_on:
+                id: backlight
+                brightness: 100%
+                transition_length: 150ms
+            - component.update: lcd
+
+select:
+  - platform: template
+    id: face
+    name: Gauge Style
+    icon: mdi:gauge
+    options:
+      - Ring
+      - Race Tach
+      - Ferrari
+      - Porsche
+      - Minimal
+      - Segments
+      - Twin
+      - Color Test
+    initial_option: Ring
+    optimistic: true
+    restore_value: true
+    on_value:
+      - lambda: 'if (i >= 1 && i <= 3) id(tach_sweep_ms) = millis();'
+      - component.update: lcd
+
+binary_sensor:
+  - platform: homeassistant
+    id: peak_heating
+    entity_id: switch.peak_pro_02743_heat_session
+    on_press:
+      # [features] arm ready detector for this session
+      - lambda: |-
+          id(ready_armed) = true;
+          id(heat_start_ms) = millis();
+          id(last_remaining) = NAN;
+    on_release:
+      - lambda: |-
+          id(ready_armed) = false;
+          id(ready_flash) = false;
+  - platform: homeassistant
+    id: peak_awake
+    entity_id: binary_sensor.peak_pro_02743_awake
+  - platform: gpio
+    id: knob_btn
+    pin:
+      number: GPIO42
+      inverted: true
+      mode:
+        input: true
+        pullup: true
+    on_press:
+      - script.execute: user_activity
+    on_click:
+      - min_length: 20ms
+        max_length: 600ms
+        then:
+          - lambda: 'id(page) = (id(page) + 1) % 2;'
+          - component.update: lcd
+      - min_length: 1500ms
+        max_length: 5000ms
+        then:
+          - homeassistant.action:
+              action: switch.toggle
+              data:
+                entity_id: switch.peak_pro_02743_heat_session
+
+text_sensor:
+  - platform: homeassistant
+    id: peak_profile
+    entity_id: select.peak_pro_02743_active_profile
+  - platform: homeassistant
+    id: p1
+    entity_id: text.peak_pro_02743_profile_1_name
+  - platform: homeassistant
+    id: p2
+    entity_id: text.peak_pro_02743_profile_2_name
+  - platform: homeassistant
+    id: p3
+    entity_id: text.peak_pro_02743_profile_3_name
+  - platform: homeassistant
+    id: p4
+    entity_id: text.peak_pro_02743_profile_4_name
+
+# [features] ready detection, ready_flash expiry and backlight dim/wake
+interval:
+  - interval: 250ms
+    then:
+      - lambda: |-
+          const uint32_t now = millis();
+
+          // ---- ready_flash expiry ----
+          if (id(ready_flash) && (int32_t)(now - id(ready_until_ms)) >= 0) {
+            id(ready_flash) = false;
+          }
+
+          // ---- ready detection (once per heat session) ----
+          if (id(ready_armed) && id(peak_heating).state &&
+              (now - id(heat_start_ms)) > 2000) {
+            int cur = atoi(id(peak_profile).state.c_str());
+            float tgt_c = cur == 1 ? id(t1).state : cur == 2 ? id(t2).state
+                        : cur == 3 ? id(t3).state : cur == 4 ? id(t4).state : NAN;
+            float temp_f = id(peak_temp).state;
+            float rem = id(peak_remaining).state;
+            bool ready = false;
+            if (!std::isnan(tgt_c) && tgt_c > 0) {
+              // Primary: heater (°F) within 8 °F of profile target (°C -> °F).
+              float tgt_f = tgt_c * 9.0f / 5.0f + 32.0f;
+              ready = !std::isnan(temp_f) && temp_f >= tgt_f - 8.0f;
+            } else {
+              // Fallback (target unknown): countdown has started ticking.
+              float last = id(last_remaining);
+              ready = !std::isnan(rem) && !std::isnan(last) && rem > 0 && rem < last;
+            }
+            if (!std::isnan(rem)) id(last_remaining) = rem;
+            if (ready) {
+              id(ready_armed) = false;
+              id(ready_flash) = true;
+              id(ready_until_ms) = now + 3000;
+              id(lcd).update();
+            }
+          }
+
+          // ---- backlight dim / wake ----
+          bool idle = (now - id(last_touch_ms)) > 60000;
+          bool want_dim = idle && !id(peak_awake).state && !id(peak_heating).state;
+          if (want_dim && !id(screen_dim)) {
+            id(screen_dim) = true;
+            auto call = id(backlight).turn_on();
+            call.set_brightness(0.15f);
+            call.set_transition_length(2000);
+            call.perform();
+          } else if (!want_dim && id(screen_dim)) {
+            id(screen_dim) = false;
+            auto call = id(backlight).turn_on();
+            call.set_brightness(1.0f);
+            call.set_transition_length(300);
+            call.perform();
+          }
+  - interval: 125ms
+    then:
+      - if:
+          condition:
+            lambda: 'return !id(show_splash) && (id(ui_anim) || id(ready_flash));'
+          then:
+            - component.update: lcd
+
+output:
+  - platform: ledc
+    id: bl_out
+    pin: GPIO9
+    channel: 0          # [features] pinned: timer 0
+
+light:
+  - platform: monochromatic
+    id: backlight
+    name: Screen Backlight
+    output: bl_out
+    restore_mode: ALWAYS_ON
+    default_transition_length: 300ms
+
+# [features] internal I2C: FT3267 touch (0x38) + BM8563 RTC (0x51)
+i2c:
+  id: i2c_int
+  sda: GPIO11
+  scl: GPIO12
+  scan: false
+
+touchscreen:
+  - platform: ft63x6
+    id: touch
+    i2c_id: i2c_int
+    display: lcd
+    interrupt_pin: GPIO14
+    on_touch:
+      - lambda: |-
+          uint32_t now = millis();
+          if (now - id(last_tap_ms) < 300) return;
+          id(last_tap_ms) = now;
+          id(page) = (id(page) + 1) % 2;
+      - script.execute: user_activity
+      - component.update: lcd
+
+time:
+  - platform: homeassistant
+    id: ha_time
+    on_time_sync:
+      - pcf8563.write_time: rtc
+  - platform: pcf8563
+    id: rtc
+    i2c_id: i2c_int
+    update_interval: never
+
+spi:
+  clk_pin: GPIO6
+  mosi_pin: GPIO5
+
+font:
+  # Big numerals: Inter Light reads as instrument dial rather than app UI
+  - file: "gfonts://Inter@300"
+    id: f_temp
+    size: 70
+    bpp: 4
+    glyphs: "0123456789-"
+  - file: "gfonts://Inter@300"
+    id: f_num
+    size: 46
+    bpp: 4
+    glyphs: "0123456789-"
+  - file: "gfonts://Inter@600"
+    id: f_title
+    size: 22
+    bpp: 4
+    glyphs: " !\"#%&'()+,-./0123456789:?ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz°"
+  - file: "gfonts://Inter@500"
+    id: f_body
+    size: 17
+    bpp: 4
+    glyphs: " !\"#%&'()+,-./0123456789:?ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz°"
+  - file: "gfonts://Inter@500"
+    id: f_label
+    size: 13
+    bpp: 4
+    glyphs: " !\"#%&'()+,-./0123456789:?ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz°"
+
+color:
+  # neutrals
+  - id: c_fg            # primary text
+    hex: "E8E6E3"
+  - id: c_mid           # secondary text
+    hex: "8A8A8A"
+  - id: c_dim           # tertiary text / dim-face numerals
+    hex: "5C5C5C"
+  - id: c_dim2          # faded wheel neighbours, dim-face battery text
+    hex: "3A3A3A"
+  - id: c_seg           # unselected picker segments, dividers
+    hex: "2A2A2A"
+  - id: c_track         # empty gauge track
+    hex: "1A1A1A"
+  - id: c_hair          # dim-face outline
+    hex: "151515"
+  - id: c_tick
+    hex: "2C2C2C"
+  - id: c_tick_major
+    hex: "4C4C4C"
+  - id: c_idle_fill     # gauge fill when not heating
+    hex: "4A4A4A"
+  # heat accent
+  - id: c_heat
+    hex: "FF7A1A"
+  - id: c_heat_hi       # first instant of the Ready ring
+    hex: "FFC08A"
+  - id: c_heat_dim      # bezel ticks during Ready
+    hex: "5A2A08"
+  # battery only
+  - id: c_ok
+    hex: "3FB950"
+  - id: c_warn
+    hex: "D29922"
+  - id: c_bad
+    hex: "F85149"
+
+image:
+  - file: splash.png
+    id: splash
+    type: RGB565
+    transparency: alpha_channel
+  # 14x24 Puffco mark, grayscale coverage mask, tinted at draw time
+  - file: mark.png
+    id: mark
+    type: GRAYSCALE
+    transparency: alpha_channel
+
+# Drives smooth frames only while something is moving (easing, wheel scroll, Ready ring).
+# Otherwise the display's own 1 s update_interval is the only redraw.
+display:
+  - platform: mipi_spi
+    id: lcd
+    model: GC9A01A
+    cs_pin: GPIO7
+    dc_pin: GPIO4
+    reset_pin: GPIO8
+    invert_colors: true
+    data_rate: 40MHz
+    update_interval: 1s
+    lambda: |-
+      it.fill(Color::BLACK);
+      if (id(show_splash)) {
+        it.image(0, 0, id(splash));
+        return;
+      }
+
+      // ---------- geometry ----------
+      const int cx = 120, cy = 120;
+      const float A0 = 135.0f, SWEEP = 270.0f;   // main dial, 7:30 clockwise to 4:30
+      const float B0 = 72.0f, B1 = 108.0f;       // battery arc lives in the bottom gap
+      const float R_IN = 100.0f, R_OUT = 105.0f; // gauge band
+
+      // ---------- frame timing ----------
+      uint32_t now = millis();
+      float dt = id(ui_last_ms) == 0 ? 0.2f : (now - id(ui_last_ms)) / 1000.0f;
+      id(ui_last_ms) = now;
+      if (dt > 0.2f) dt = 0.2f;
+      bool anim = false;
+
+      // ---------- drawing primitives ----------
+      auto mix = [](Color a, Color b, float t) -> Color {
+        if (t <= 0.0f) return a;
+        if (t >= 1.0f) return b;
+        return Color(a.r + (int) ((b.r - a.r) * t), a.g + (int) ((b.g - a.g) * t), a.b + (int) ((b.b - a.b) * t));
+      };
+
+      // Anti-aliased ring segment. Angles in degrees, 0 = 3 o'clock, 90 = 6 o'clock,
+      // filled clockwise from a0 to a1. `under` is what the segment sits on (for its end caps).
+      Color bgc = Color::BLACK;  // what AA edges blend into; tach faces repaint it
+      auto arc = [&](float r0, float r1, float a0, float a1, Color col, Color under) {
+        float span = a1 - a0;
+        if (span <= 0.05f) return;
+        bool full = span >= 359.9f;
+        float ro = r1 + 1.0f, ri = r0 - 1.0f;
+        int R = (int) ceilf(ro);
+        for (int dy = -R; dy < R; dy++) {
+          float fy = dy + 0.5f, fy2 = fy * fy;
+          float xo2 = ro * ro - fy2;
+          if (xo2 <= 0.0f) continue;
+          int xo = (int) ceilf(sqrtf(xo2));
+          float xi2 = ri * ri - fy2;
+          int xi = xi2 > 0.0f ? (int) floorf(sqrtf(xi2)) : 0;
+          for (int dx = -xo; dx < xo; dx++) {
+            if (xi > 1 && dx > -xi && dx < xi - 1) { dx = xi - 2; continue; }  // skip the hole
+            float fx = dx + 0.5f;
+            float d = sqrtf(fx * fx + fy2);
+            float cr = fminf(r1 - d, d - r0) + 0.5f;
+            if (cr <= 0.0f) continue;
+            if (cr > 1.0f) cr = 1.0f;
+            float ca = 1.0f;
+            if (!full) {
+              float rel = atan2f(fy, fx) * 57.29578f - a0;
+              while (rel < 0.0f) rel += 360.0f;
+              while (rel >= 360.0f) rel -= 360.0f;
+              if (rel > span + (360.0f - span) * 0.5f) rel -= 360.0f;
+              float k = d * 0.01745329f;
+              float e0 = fminf(fmaxf(rel * k + 0.5f, 0.0f), 1.0f);
+              float e1 = fminf(fmaxf((span - rel) * k + 0.5f, 0.0f), 1.0f);
+              ca = e0 + e1 - 1.0f;
+              if (ca <= 0.0f) continue;
+            }
+            it.draw_pixel_at(cx + dx, cy + dy, mix(bgc, mix(under, col, ca), cr));
+          }
+        }
+      };
+
+      // Anti-aliased bezel ticks: n ticks from a0 every `step` degrees, every `major_every`-th longer/brighter.
+      auto ticks = [&](float r0, float r1, float rmaj, float a0, float step, int n, int major_every,
+                       float w, Color cmin, Color cmaj) {
+        float ro = r1 + 1.0f, ri = fminf(r0, rmaj) - 1.0f;
+        int R = (int) ceilf(ro);
+        for (int dy = -R; dy < R; dy++) {
+          float fy = dy + 0.5f, fy2 = fy * fy;
+          float xo2 = ro * ro - fy2;
+          if (xo2 <= 0.0f) continue;
+          int xo = (int) ceilf(sqrtf(xo2));
+          float xi2 = ri * ri - fy2;
+          int xi = xi2 > 0.0f ? (int) floorf(sqrtf(xi2)) : 0;
+          for (int dx = -xo; dx < xo; dx++) {
+            if (xi > 1 && dx > -xi && dx < xi - 1) { dx = xi - 2; continue; }
+            float fx = dx + 0.5f;
+            float d = sqrtf(fx * fx + fy2);
+            if (d < ri || d > ro) continue;
+            float rel = atan2f(fy, fx) * 57.29578f - a0;
+            while (rel < -step * 0.5f) rel += 360.0f;
+            while (rel >= 360.0f - step * 0.5f) rel -= 360.0f;
+            int i = (int) lroundf(rel / step);
+            if (i < 0 || i >= n) continue;
+            bool maj = major_every > 0 && (i % major_every) == 0;
+            float cr = fminf(r1 - d, d - (maj ? rmaj : r0)) + 0.5f;
+            if (cr <= 0.0f) continue;
+            if (cr > 1.0f) cr = 1.0f;
+            float off = fabsf(rel - i * step) * d * 0.01745329f;
+            float ct = w * 0.5f + 0.5f - off;
+            if (ct <= 0.0f) continue;
+            if (ct > 1.0f) ct = 1.0f;
+            it.draw_pixel_at(cx + dx, cy + dy, mix(bgc, maj ? cmaj : cmin, cr * ct));
+          }
+        }
+      };
+
+      // Number with a superscript °F, the pair optically centred on cx.
+      auto temp_text = [&](float v, int base, BaseFont *f, int cap, BaseFont *fu, int ucap, Color c, Color cu) {
+        char buf[8];
+        if (isnan(v)) {
+          it.print(cx, base, f, c, TextAlign::BASELINE_CENTER, "--");
+          return;
+        }
+        snprintf(buf, sizeof(buf), "%d", (int) lroundf(v));
+        int x1, y1, w, h, ux1, uy1, uw, uh;
+        it.get_text_bounds(0, 0, buf, f, TextAlign::BASELINE_LEFT, &x1, &y1, &w, &h);
+        it.get_text_bounds(0, 0, "°F", fu, TextAlign::BASELINE_LEFT, &ux1, &uy1, &uw, &uh);
+        const int gap = 2;
+        int x = cx - (w + gap + uw) / 2;
+        it.print(x, base, f, c, TextAlign::BASELINE_LEFT, buf);
+        it.print(x + w + gap, base - cap + ucap, fu, cu, TextAlign::BASELINE_LEFT, "°F");
+      };
+
+      // Centred text that steps down a size rather than running into the bezel.
+      auto fit = [&](int y, BaseFont *fa, BaseFont *fb, Color c, const char *s, int maxw) {
+        int x1, y1, w, h;
+        it.get_text_bounds(0, 0, s, fa, TextAlign::TOP_LEFT, &x1, &y1, &w, &h);
+        it.print(cx, y, w > maxw ? fb : fa, c, TextAlign::CENTER, s);
+      };
+
+      // ---------- data ----------
+      float T = id(peak_temp).state;
+      bool hasT = !isnan(T);
+      bool heating = id(peak_heating).state;
+      bool awake = id(peak_awake).state;
+      float batt = id(peak_batt).state;
+      int cur = atoi(id(peak_profile).state.c_str());
+      if (cur < 1 || cur > 4) cur = 0;
+
+      auto pname = [&](int n) -> std::string {
+        std::string s = n == 1 ? id(p1).state : n == 2 ? id(p2).state : n == 3 ? id(p3).state : n == 4 ? id(p4).state : "";
+        if (s.empty() && n >= 1) s = "Profile " + to_string(n);
+        return s;
+      };
+      auto ptemp = [&](int n) -> float {
+        float c = n == 1 ? id(t1).state : n == 2 ? id(t2).state : n == 3 ? id(t3).state : n == 4 ? id(t4).state : NAN;
+        return isnan(c) ? NAN : c * 1.8f + 32.0f;
+      };
+      auto pdur = [&](int n) -> float {
+        return n == 1 ? id(d1).state : n == 2 ? id(d2).state : n == 3 ? id(d3).state : n == 4 ? id(d4).state : NAN;
+      };
+      auto spec = [&](int n, char *buf, size_t len) {
+        float t = ptemp(n), d = pdur(n);
+        buf[0] = 0;
+        if (!isnan(t) && !isnan(d)) snprintf(buf, len, "%d°F    %d s", (int) lroundf(t), (int) lroundf(d));
+        else if (!isnan(t)) snprintf(buf, len, "%d°F", (int) lroundf(t));
+        else if (!isnan(d)) snprintf(buf, len, "%d s", (int) lroundf(d));
+      };
+
+      // ---------- easing / state ----------
+      if (!hasT) {
+        id(ui_temp) = NAN;
+      } else if (isnan(id(ui_temp))) {
+        id(ui_temp) = T;
+      } else {
+        id(ui_temp) += (T - id(ui_temp)) * (1.0f - expf(-dt / 0.35f));
+        if (fabsf(T - id(ui_temp)) > 0.5f) anim = true; else id(ui_temp) = T;
+      }
+      float Td = id(ui_temp);
+
+      float tgt = ptemp(cur);
+      float tgt_eff = isnan(tgt) ? 550.0f : tgt;
+      float rem = id(peak_remaining).state;
+      float dur = pdur(cur);
+      bool timed = !isnan(rem) && !isnan(dur) && dur > 0.0f;
+      // holding = at temperature, session clock running
+      bool holding = heating && ((hasT && T >= tgt_eff - 8.0f) || (isnan(tgt) && timed && rem < dur - 1.0f));
+
+      // gauge: fills with temperature on the way up, then drains with time remaining
+      float goal = 0.0f;
+      if (holding && timed) goal = rem / dur;
+      else if (hasT) goal = (T - 200.0f) / (tgt_eff - 200.0f);
+      goal = fminf(fmaxf(goal, 0.0f), 1.0f);
+      id(ui_prog) += (goal - id(ui_prog)) * (1.0f - expf(-dt / 0.30f));
+      if (fabsf(goal - id(ui_prog)) > 0.003f) anim = true; else id(ui_prog) = goal;
+
+      // profile wheel: kick one slot in the direction of travel, then settle
+      id(ui_wheel) *= expf(-dt / 0.15f);
+      if (fabsf(id(ui_wheel)) < 0.01f) id(ui_wheel) = 0.0f; else anim = true;
+      if (id(picking)) {
+        int sel = id(pending_profile);
+        int last = id(ui_wheel_last);
+        if (last >= 1 && sel >= 1 && sel != last) {
+          int diff = (sel - last + 4) % 4;
+          if (diff == 1) id(ui_wheel) += 1.0f;
+          else if (diff == 3) id(ui_wheel) -= 1.0f;
+          id(ui_wheel) = fminf(fmaxf(id(ui_wheel), -1.5f), 1.5f);
+          anim = true;
+        }
+        id(ui_wheel_last) = sel;
+      } else {
+        id(ui_wheel_last) = cur;
+        id(ui_wheel) = 0.0f;
+      }
+
+      if (id(ready_flash) && !id(ui_ready_prev)) id(ui_ready_ms) = now;
+      id(ui_ready_prev) = id(ready_flash);
+      id(ui_anim) = anim;
+
+      // ---------- shared chrome ----------
+      auto batt_col = [&](float b) -> Color { return b > 40 ? id(c_ok) : b > 20 ? id(c_warn) : id(c_bad); };
+      auto battery = [&](float r0, float r1, float strength) {
+        arc(r0, r1, B0, B1, mix(Color::BLACK, id(c_track), strength), Color::BLACK);
+        if (!isnan(batt) && batt > 0.0f) {
+          float s = (B1 - B0) * fminf(batt, 100.0f) / 100.0f;
+          arc(r0, r1, B1 - s, B1, mix(Color::BLACK, batt_col(batt), strength), mix(Color::BLACK, id(c_track), strength));
+        }
+      };
+      auto batt_text = [&](int y, Color c) {
+        if (!isnan(batt)) it.printf(cx, y, id(f_label), c, TextAlign::CENTER, "%d%%", (int) lroundf(batt));
+      };
+      auto dial_ticks = [&](Color cmin, Color cmaj) {
+        ticks(110.0f, 115.0f, 107.5f, A0, SWEEP / 40.0f, 41, 10, 1.4f, cmin, cmaj);
+      };
+
+      // ================= READY (transient, ~3 s) =================
+      if (id(ready_flash)) {
+        float t = (now - id(ui_ready_ms)) / 1000.0f;
+        float k = fminf(t / 0.8f, 1.0f);   // ring lands bright, settles to the accent
+        dial_ticks(id(c_heat_dim), id(c_heat_dim));
+        arc(R_IN, R_OUT, 0.0f, 360.0f, mix(id(c_heat_hi), id(c_heat), k), Color::BLACK);
+        it.print(cx, 68, id(f_title), id(c_heat), TextAlign::CENTER, "Ready");
+        temp_text(Td, 142, id(f_temp), 51, id(f_body), 12, id(c_fg), id(c_mid));
+        if (cur) fit(168, id(f_body), id(f_label), id(c_mid), pname(cur).c_str(), 170);
+        return;
+      }
+
+      // ================= PROFILE WHEEL (knob turned) =================
+      if (id(picking)) {
+        int sel = id(pending_profile);
+        if (sel < 1 || sel > 4) sel = 1;
+        dial_ticks(id(c_tick), id(c_tick_major));
+        const float seg = SWEEP / 4.0f;
+        for (int i = 0; i < 4; i++) {
+          float a = A0 + i * seg;
+          arc(R_IN, R_OUT, a + 1.5f, a + seg - 1.5f, (i + 1 == sel) ? id(c_fg) : id(c_seg), Color::BLACK);
+        }
+        battery(R_IN, R_OUT, 1.0f);
+        it.print(cx, 50, id(f_label), id(c_dim), TextAlign::CENTER, "Profile");
+        const int wy = 114, slot = 34;
+        for (int k = -2; k <= 2; k++) {
+          int n = ((sel - 1 + k) % 4 + 4) % 4 + 1;
+          float s = k + id(ui_wheel);
+          float ad = fabsf(s);
+          if (ad > 1.8f) continue;
+          int y = wy + (int) lroundf(s * slot);
+          Color c = ad <= 1.0f ? mix(id(c_fg), id(c_dim2), ad) : mix(id(c_dim2), Color::BLACK, (ad - 1.0f) / 0.8f);
+          std::string nm = pname(n);
+          if (ad < 0.5f) fit(y, id(f_title), id(f_body), c, nm.c_str(), 188);
+          else fit(y, id(f_body), id(f_label), c, nm.c_str(), 170);
+        }
+        char sb[28];
+        spec(sel, sb, sizeof(sb));
+        if (sb[0]) it.print(cx, 178, id(f_label), id(c_mid), TextAlign::CENTER, sb);
+        return;
+      }
+
+      // ================= DIM / IDLE FACE =================
+      if (id(screen_dim)) {
+        arc(104.0f, 105.0f, 0.0f, 360.0f, id(c_hair), Color::BLACK);
+        battery(103.0f, 106.0f, 0.45f);
+        temp_text(Td, 136, id(f_num), 33, id(f_label), 9, id(c_dim), id(c_dim2));
+        batt_text(162, id(c_dim2));
+        return;
+      }
+
+      // ================= STATS =================
+      if (id(page) == 1) {
+        float pd = id(peak_per_day).state;
+        float td = id(peak_dabs).state;
+        dial_ticks(id(c_tick), id(c_tick_major));
+        arc(R_IN, R_OUT, A0, A0 + SWEEP, id(c_track), Color::BLACK);
+        float f = isnan(pd) ? 0.0f : fminf(fmaxf(pd / 10.0f, 0.0f), 1.0f);  // dial reads 0-10 per day
+        arc(R_IN, R_OUT, A0, A0 + SWEEP * f, id(c_mid), id(c_track));
+        battery(R_IN, R_OUT, 1.0f);
+        it.print(60, 178, id(f_label), id(c_dim), TextAlign::CENTER, "0");
+        it.print(180, 178, id(f_label), id(c_dim), TextAlign::CENTER, "10");
+
+        char b[16];
+        it.print(cx, 60, id(f_label), id(c_dim), TextAlign::CENTER, "Total dabs");
+        if (isnan(td)) snprintf(b, sizeof(b), "--"); else snprintf(b, sizeof(b), "%d", (int) lroundf(td));
+        it.print(cx, 114, id(f_num), id(c_fg), TextAlign::BASELINE_CENTER, b);
+        it.horizontal_line(cx - 18, 133, 36, id(c_seg));
+        if (isnan(pd)) snprintf(b, sizeof(b), "--"); else snprintf(b, sizeof(b), "%.1f", pd);
+        it.print(cx, 154, id(f_title), id(c_fg), TextAlign::CENTER, b);
+        it.print(cx, 177, id(f_label), id(c_dim), TextAlign::CENTER, "per day");
+        batt_text(200, id(c_mid));
+        return;
+      }
+
+      // ================= ALTERNATE FACES (Gauge Style select) =================
+      auto ai = id(face).active_index();
+      int style = ai.has_value() ? (int) *ai : 0;
+      auto pt = [&](float r, float deg, int &x, int &y) {
+        float a = deg * 0.01745329f;
+        x = cx + (int) lroundf(r * cosf(a));
+        y = cy + (int) lroundf(r * sinf(a));
+      };
+      auto status = [&]() -> const char * {
+        if (!hasT) return "Not connected";
+        if (holding) return "Ready";
+        if (heating) return "Heating";
+        return awake ? "Idle" : "Asleep";
+      };
+      float P = id(ui_prog);
+      // temperature progress toward the target, independent of the session countdown
+      float Ptemp = hasT ? fminf(fmaxf((Td - 200.0f) / (tgt_eff - 200.0f), 0.0f), 1.0f) : 0.0f;
+
+      // ---------- TACHS: one dial, three liveries ----------
+      struct Tach {
+        Color face, bezel, tick_min, tick_maj, num, num_red, red, needle, hub, hub_ring, label, win_bg, win_fg, win_line;
+        bool band, lights;
+      };
+      auto tach = [&](const Tach &t) {
+        const float LO = 0.0f, HI = 700.0f;
+        auto ang = [&](float v) { return A0 + SWEEP * fminf(fmaxf((v - LO) / (HI - LO), 0.0f), 1.0f); };
+        if (t.face.r || t.face.g || t.face.b) it.filled_circle(cx, cy, 115, t.face);
+        bgc = Color::BLACK;                       // bezel's outer edge meets the black screen
+        arc(113.0f, 119.0f, 0.0f, 360.0f, t.bezel, t.bezel);
+        bgc = t.face;
+        if (t.band) arc(104.0f, 112.0f, ang(tgt_eff), A0 + SWEEP, t.red, t.face);
+        ticks(104.0f, 112.0f, 97.0f, A0, SWEEP / 28.0f, 29, 4, 1.8f, t.tick_min, t.tick_maj);
+        if (!t.band) ticks(104.0f, 112.0f, 97.0f, ang(tgt_eff), SWEEP / 28.0f,
+                           (int) floorf((A0 + SWEEP - ang(tgt_eff)) / (SWEEP / 28.0f)) + 1, 0, 2.2f, t.red, t.red);
+        for (int n = 0; n <= 7; n++) {
+          int x, y;
+          pt(82.0f, ang(n * 100.0f), x, y);
+          char b[3];
+          snprintf(b, sizeof(b), "%d", n);
+          it.print(x, y, id(f_title), (n * 100.0f >= tgt_eff) ? t.num_red : t.num, TextAlign::CENTER, b, t.face);
+        }
+        // Puffco badge where the marque would sit, label moves under the hub
+        it.image(cx, 76, id(mark), ImageAlign::TOP_CENTER, t.num, t.face);
+        it.print(cx, 146, id(f_label), t.label, TextAlign::CENTER, "x100 °F", t.face);
+        if (t.lights) {
+          const int NL = 5;
+          int lit = (int) floorf(Ptemp * NL + 0.001f);
+          bool flash = holding && ((now / 250) % 2 == 0);
+          for (int i = 0; i < NL; i++) {
+            int x = cx - 32 + i * 16, y = 64;
+            Color on = i < 2 ? id(c_ok) : i < 4 ? id(c_warn) : id(c_bad);
+            bool lamp = holding ? flash : (heating && i < lit);
+            it.filled_circle(x, y, 4, lamp ? on : mix(t.face, Color::BLACK, 0.55f));
+          }
+          if (heating) id(ui_anim) = true;
+        }
+        // digital readout window
+        it.filled_rectangle(cx - 34, 160, 68, 24, t.win_bg);
+        it.rectangle(cx - 34, 160, 68, 24, t.win_line);
+        if (hasT) it.printf(cx, 172, id(f_body), t.win_fg, TextAlign::CENTER, "%d°F", (int) lroundf(Td), t.win_bg);
+        else it.print(cx, 172, id(f_body), t.win_fg, TextAlign::CENTER, "--", t.win_bg);
+        if (cur) it.print(cx, 196, id(f_label), t.label, TextAlign::CENTER, pname(cur).c_str(), t.face);
+        // startup sweep: needle runs to the stop and back (boot / face selected)
+        float nv = Td;
+        bool needle = hasT;
+        float st = (now - id(tach_sweep_ms)) / 1000.0f;
+        if (id(tach_sweep_ms) != 0 && st < 1.4f) {
+          float base = hasT ? Td : LO;
+          float k = st < 0.6f ? st / 0.6f : (st < 0.8f ? 1.0f : 1.0f - (st - 0.8f) / 0.6f);
+          k = k * k * (3.0f - 2.0f * k);  // smoothstep
+          nv = base + (HI - base) * k;
+          needle = true;
+          id(ui_anim) = true;
+        }
+        if (needle) {
+          float a = ang(nv) * 0.01745329f;
+          float ca = cosf(a), sa = sinf(a), px = -sa, py = ca;
+          int tx = cx + (int) lroundf(100.0f * ca), ty = cy + (int) lroundf(100.0f * sa);
+          int bx1 = cx + (int) lroundf(4.5f * px), by1 = cy + (int) lroundf(4.5f * py);
+          int bx2 = cx - (int) lroundf(4.5f * px), by2 = cy - (int) lroundf(4.5f * py);
+          int lx = cx - (int) lroundf(20.0f * ca), ly = cy - (int) lroundf(20.0f * sa);
+          it.filled_triangle(tx, ty, bx1, by1, bx2, by2, t.needle);
+          it.filled_triangle(lx, ly, bx1, by1, bx2, by2, t.needle);
+        }
+        it.filled_circle(cx, cy, 13, t.hub_ring);
+        it.filled_circle(cx, cy, 10, t.hub);
+        battery(R_IN + 9.0f, R_OUT + 8.0f, 1.0f);
+        bgc = Color::BLACK;
+      };
+
+      if (style == 1) {
+        // RACE TACH: black face, orange needle, red band, shift lights
+        tach({Color::BLACK, Color(42, 44, 48), id(c_mid), id(c_fg), id(c_fg), id(c_bad), id(c_bad), id(c_heat),
+              Color::BLACK, Color(58, 61, 68), id(c_dim), Color::BLACK, id(c_fg), Color(58, 61, 68), true, true});
+        return;
+      }
+      if (style == 2) {
+        // FERRARI: Giallo face, black numerals and ticks, red needle and redline, shift lights
+        const Color giallo(255, 158, 0), rosso(220, 20, 28);  // panel is green-heavy; this reads as Giallo
+        tach({giallo, Color(20, 20, 20), Color(30, 30, 30), Color::BLACK, Color::BLACK, rosso, rosso, rosso,
+              Color(16, 16, 16), Color(40, 40, 40), Color(40, 34, 10), Color(16, 16, 16), Color(240, 240, 240),
+              Color(16, 16, 16), true, true});
+        return;
+      }
+      if (style == 3) {
+        // PORSCHE: matte black, pale green numerals, white needle, red redline ticks, silver bezel
+        const Color lume(206, 226, 196), silver(150, 154, 160), red(214, 40, 40);
+        tach({Color(6, 6, 6), silver, Color(170, 172, 168), Color(236, 236, 230), lume, red, red, Color(242, 242, 236),
+              Color(6, 6, 6), Color(46, 48, 50), Color(150, 168, 144), Color(6, 6, 6), lume, Color(46, 48, 50),
+              false, false});
+        return;
+      }
+
+      if (style == 7) {
+        // ---------- COLOR TEST: labelled swatches for calibrating this panel by eye ----------
+        struct Sw { const char *k; uint8_t r, g, b; };
+        static const Sw sw[] = {
+          {"A", 255, 255, 0},  {"B", 255, 220, 0},  {"C", 255, 190, 0},  {"D", 255, 158, 0},
+          {"E", 255, 120, 0},  {"F", 255, 0, 0},    {"G", 220, 20, 28},  {"H", 0, 255, 0},
+          {"I", 0, 0, 255},    {"J", 255, 255, 255},{"K", 160, 160, 160},{"L", 255, 122, 26},
+        };
+        const int cols = 4, w = 40, h = 34, gx = 4, gy = 6;
+        int x0 = cx - (cols * w + (cols - 1) * gx) / 2, y0 = 52;
+        for (int i = 0; i < 12; i++) {
+          int x = x0 + (i % cols) * (w + gx), y = y0 + (i / cols) * (h + gy);
+          Color c(sw[i].r, sw[i].g, sw[i].b);
+          it.filled_rectangle(x, y, w, h, c);
+          bool dark = (sw[i].r * 3 + sw[i].g * 6 + sw[i].b) / 10 > 150;
+          it.print(x + w / 2, y + h / 2, id(f_body), dark ? Color::BLACK : Color::WHITE, TextAlign::CENTER, sw[i].k, c);
+        }
+        it.print(cx, 186, id(f_label), id(c_mid), TextAlign::CENTER, "Which yellow looks right?");
+        return;
+      }
+
+      if (style == 4) {
+        // ---------- MINIMAL: numerals and one hairline ----------
+        arc(112.0f, 114.5f, 0.0f, 360.0f, id(c_track), Color::BLACK);
+        if (P > 0.001f) arc(112.0f, 114.5f, 270.0f, 270.0f + 360.0f * P, heating ? id(c_heat) : id(c_idle_fill), id(c_track));
+        temp_text(Td, 138, id(f_temp), 51, id(f_body), 12, (awake || heating) ? id(c_fg) : id(c_mid), id(c_mid));
+        if (heating) it.print(cx, 166, id(f_label), id(c_heat), TextAlign::CENTER, status());
+        else if (cur) fit(166, id(f_label), id(f_label), id(c_dim), pname(cur).c_str(), 160);
+        return;
+      }
+
+      if (style == 5) {
+        // ---------- SEGMENTS: LED meter ----------
+        const int NS = 30;
+        const float span = SWEEP / NS, gap = 2.4f;
+        int on = (int) lroundf(P * NS);
+        for (int i = 0; i < NS; i++) {
+          float a0 = A0 + i * span + gap * 0.5f, a1 = A0 + (i + 1) * span - gap * 0.5f;
+          Color c = id(c_track);
+          if (i < on) c = heating ? mix(id(c_warn), id(c_heat), (float) i / NS) : id(c_idle_fill);
+          arc(96.0f, 112.0f, a0, a1, c, Color::BLACK);
+        }
+        battery(100.0f, 106.0f, 1.0f);
+        it.print(cx, 62, id(f_label), heating ? id(c_heat) : id(c_dim), TextAlign::CENTER, status());
+        temp_text(Td, 136, id(f_temp), 51, id(f_body), 12, (awake || heating) ? id(c_fg) : id(c_mid), id(c_mid));
+        if (cur) fit(164, id(f_body), id(f_label), id(c_mid), pname(cur).c_str(), 160);
+        batt_text(192, id(c_dim));
+        return;
+      }
+
+      if (style == 6) {
+        // ---------- TWIN: heat on the left, battery on the right ----------
+        const float TL0 = 125.0f, TL1 = 235.0f;          // left arc, bottom -> top
+        const float BR0 = 305.0f, BR1 = 415.0f;          // right arc, top -> bottom
+        arc(100.0f, 110.0f, TL0, TL1, id(c_track), Color::BLACK);
+        arc(100.0f, 110.0f, BR0, BR1, id(c_track), Color::BLACK);
+        if (P > 0.001f) arc(100.0f, 110.0f, TL0, TL0 + (TL1 - TL0) * P, heating ? id(c_heat) : id(c_idle_fill), id(c_track));
+        if (!isnan(batt) && batt > 0.0f) {
+          float bf = fminf(batt, 100.0f) / 100.0f;
+          arc(100.0f, 110.0f, BR1 - (BR1 - BR0) * bf, BR1, batt_col(batt), id(c_track));
+        }
+        it.print(66, 206, id(f_label), heating ? id(c_heat) : id(c_dim), TextAlign::CENTER, "Heat");
+        if (!isnan(batt)) it.printf(174, 206, id(f_label), id(c_dim), TextAlign::CENTER, "%d%%", (int) lroundf(batt));
+        it.print(cx, 62, id(f_label), heating ? id(c_heat) : id(c_dim), TextAlign::CENTER, status());
+        temp_text(Td, 136, id(f_temp), 51, id(f_body), 12, (awake || heating) ? id(c_fg) : id(c_mid), id(c_mid));
+        if (cur) fit(164, id(f_body), id(f_label), id(c_mid), pname(cur).c_str(), 150);
+        return;
+      }
+
+      // ================= MAIN (idle / heating / holding) =================
+      dial_ticks(id(c_tick), id(c_tick_major));
+      arc(R_IN, R_OUT, A0, A0 + SWEEP, id(c_track), Color::BLACK);
+      if (P > 0.001f) {
+        float a1 = A0 + SWEEP * P;
+        arc(R_IN, R_OUT, A0, a1, heating ? id(c_heat) : id(c_idle_fill), id(c_track));
+        if (heating) arc(R_IN, R_OUT, a1 - 1.6f, a1, id(c_fg), id(c_heat));  // fine needle at the leading edge
+      }
+      battery(R_IN, R_OUT, 1.0f);
+
+      if (heating) it.print(cx, 52, id(f_label), id(c_heat), TextAlign::CENTER, holding ? "Ready" : "Heating");
+      else it.image(cx, 40, id(mark), ImageAlign::TOP_CENTER, awake ? id(c_mid) : id(c_dim), Color::BLACK);
+
+      temp_text(Td, 130, id(f_temp), 51, id(f_body), 12, (awake || heating) ? id(c_fg) : id(c_mid), id(c_mid));
+
+      if (!hasT) {
+        it.print(cx, 157, id(f_body), id(c_mid), TextAlign::CENTER, "Not connected");
+      } else {
+        if (cur) fit(157, id(f_body), id(f_label), (awake || heating) ? id(c_fg) : id(c_mid), pname(cur).c_str(), 180);
+        char sb[28];
+        if (holding && !isnan(rem)) snprintf(sb, sizeof(sb), "%d s remaining", (int) lroundf(fmaxf(rem, 0.0f)));
+        else if (heating && !isnan(tgt)) snprintf(sb, sizeof(sb), "Target %d°F", (int) lroundf(tgt));
+        else spec(cur, sb, sizeof(sb));
+        if (sb[0]) it.print(cx, 178, id(f_label), id(c_dim), TextAlign::CENTER, sb);
+      }
+      batt_text(200, id(c_mid));

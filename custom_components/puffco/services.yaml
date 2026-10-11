@@ -1,0 +1,74 @@
+start_session:
+  fields:
+    device_id:
+      required: true
+      selector:
+        device:
+          integration: puffco
+      name: Device
+      description: Puffco device to start a heat session on.
+    profile:
+      selector:
+        number:
+          min: 1
+          max: 4
+          step: 1
+          mode: box
+      name: Profile
+      description: Optional profile to select before starting (1–4).
+
+abort_session:
+  fields:
+    device_id:
+      required: true
+      selector:
+        device:
+          integration: puffco
+      name: Device
+      description: Puffco device to abort the active heat session on.
+
+boost_session:
+  fields:
+    device_id:
+      required: true
+      selector:
+        device:
+          integration: puffco
+      name: Device
+      description: Puffco device to boost during an active heat session.
+
+set_profile:
+  fields:
+    device_id:
+      required: true
+      selector:
+        device:
+          integration: puffco
+      name: Device
+      description: Puffco device to change the active profile on.
+    profile:
+      required: true
+      selector:
+        number:
+          min: 1
+          max: 4
+          step: 1
+          mode: box
+      name: Profile
+      description: Active heat profile (1–4).
+
+reconnect:
+  fields:
+    device_id:
+      required: true
+      selector:
+        device:
+          integration: puffco
+      name: Device
+      description: Puffco device to reconnect over Bluetooth.
+    clear_bond:
+      default: false
+      selector:
+        boolean:
+      name: Clear bond
+      description: Clear stored BLE bond before reconnecting (use if pairing fails).

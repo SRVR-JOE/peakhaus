@@ -1,0 +1,78 @@
+# M5Stack ATOM Lite — dedicated Bluetooth proxy between Home Assistant and the Puffco Peak Pro.
+# Keep this device next to where the Peak lives. The M5Dial is now just a remote/display.
+esphome:
+  name: puffco-bridge
+  friendly_name: Puffco Bridge
+
+esp32:
+  board: m5stack-atom
+  framework:
+    type: esp-idf
+
+logger:
+
+api:
+  encryption:
+    key: !secret puffco_bridge_api_key
+
+ota:
+  - platform: esphome
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  ap:
+    ssid: "Puffco-Bridge-Setup"
+
+captive_portal:
+improv_serial:
+
+esp32_ble_tracker:
+  scan_parameters:
+    active: true
+    interval: 320ms
+    window: 300ms
+
+bluetooth_proxy:
+  active: true
+  connection_slots: 2
+
+# ATOM Lite front button
+binary_sensor:
+  - platform: gpio
+    pin:
+      number: GPIO39
+      inverted: true
+    name: "Button"
+    filters:
+      - delayed_on: 20ms
+      - delayed_off: 20ms
+  - platform: status
+    name: "Status"
+
+# ATOM Lite RGB LED (SK6812 on GPIO27)
+light:
+  - platform: esp32_rmt_led_strip
+    id: atom_led
+    name: "LED"
+    pin: GPIO27
+    num_leds: 1
+    chipset: SK6812
+    channel_colors: GRB
+    restore_mode: ALWAYS_OFF
+
+sensor:
+  - platform: wifi_signal
+    name: "Wi-Fi Signal"
+    update_interval: 60s
+  - platform: uptime
+    name: "Uptime"
+
+button:
+  - platform: restart
+    name: "Restart"
+
+text_sensor:
+  - platform: wifi_info
+    ip_address:
+      name: "IP Address"
