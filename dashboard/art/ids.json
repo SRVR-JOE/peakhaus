@@ -1,14 +1,54 @@
 {
-  "peak/peak_rig_bg": {
-    "id": "15dab1e5de4da00e50ee27d609173dc6",
-    "sha1": "db338ecc275f5677810a3b044a6d9f9e13925ca1"
-  },
-  "peak/peak_rig_glow": {
-    "id": "5166d91ecd84fb32d1fbb0730ad2f916",
-    "sha1": "03a0c9588e48dfe86127e945f50a22b3bcad8e0e"
-  },
-  "peak/peak_rig_none": {
-    "id": "35eec54d7932887ba33e2f88d637a814",
-    "sha1": "35534665e2c5ec21e67e21d6b88a70d5cb3fdb03"
-  }
+ "peak/banner_battery": {
+  "id": "07879e65b9b0cc4981bf4daf889a5f00",
+  "sha1": "aafd064ddd2a6783a7dc978087f67b43e87f0a65"
+ },
+ "peak/banner_bridge": {
+  "id": "0b6dfafdd8728132ddfbd08377eb4d61",
+  "sha1": "ad56180ff1bdfa36e3a4c1d047bfa1d4357e5e5a"
+ },
+ "peak/banner_lights": {
+  "id": "ced2c0a532944a9826c01415c0d1a5f7",
+  "sha1": "ccf98df76a89bc697c82846a7e8119d191696917"
+ },
+ "peak/banner_peak_pro": {
+  "id": "3fe5d6fe5cc79ac86c584a53243b707f",
+  "sha1": "abe60e759a2f3268dfc9eb5e7c5076f040f85764"
+ },
+ "peak/banner_profiles": {
+  "id": "f1377966aa0d5c9acf50464f5108e266",
+  "sha1": "b7a1de21f317c04c8f87527bf7c8dfd91ab0361e"
+ },
+ "peak/banner_session": {
+  "id": "c8d1c05bc0122ee4caf4154ed29d0c6f",
+  "sha1": "2b3ef502ba6611190ecfbe79a9a90d4c0f501a0a"
+ },
+ "peak/peak_rig_bg": {
+  "id": "15dab1e5de4da00e50ee27d609173dc6",
+  "sha1": "db338ecc275f5677810a3b044a6d9f9e13925ca1"
+ },
+ "peak/peak_rig_glow": {
+  "id": "0ae4d95a5ba56801636ea30f0b7d8196",
+  "sha1": "ec602baa4eb888eb26c9b4a8d918269cbbe2fc2e"
+ },
+ "peak/peak_rig_glow_p1": {
+  "id": "99421fe5befd2045be9fc06acdf181f9",
+  "sha1": "746cde8c7054fd40e09df1029a94eedd3820c72d"
+ },
+ "peak/peak_rig_glow_p2": {
+  "id": "072644111fbaa0f31ce3ead6f5c663d5",
+  "sha1": "279f246434da561fb24a7c180af4c5e01ea38f75"
+ },
+ "peak/peak_rig_glow_p3": {
+  "id": "ac4f0530686f1309dd3a022dfc864124",
+  "sha1": "7d032dc5b069d44d2ba445ffca3be746845c4e60"
+ },
+ "peak/peak_rig_glow_p4": {
+  "id": "3d9f0f9ed48ca8df1788e48881102cca",
+  "sha1": "f89b2280ba83f84eda2c9bcd19f4359a9f67ed8d"
+ },
+ "peak/peak_rig_none": {
+  "id": "35eec54d7932887ba33e2f88d637a814",
+  "sha1": "35534665e2c5ec21e67e21d6b88a70d5cb3fdb03"
+ }
 }

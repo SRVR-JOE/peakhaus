@@ -315,7 +315,7 @@ def bridge_section():
 
 # --------------------------------------------------------------------------- view
 
-def peak_view():
+def _plain_view():
     return {
         "type": "sections",
         "path": VIEW_PATH,
@@ -332,6 +332,101 @@ def peak_view():
             bridge_section(),
         ],
     }
+
+
+# ------------------------------------------------------------------ Daybreak skin
+
+BANNERS = {  # heading text -> art/ids.json key (peak/make_peak_banners.py)
+    "Peak Pro": "peak/banner_peak_pro", "Session": "peak/banner_session", "Profiles": "peak/banner_profiles",
+    "Battery & use": "peak/banner_battery", "Lights": "peak/banner_lights", "Bridge & Dial": "peak/banner_bridge",
+}
+
+
+def _role(card):
+    """Map a built card to a peak_style role (None = leave alone)."""
+    t = card.get("type")
+    ent = card.get("entity", "")
+    tap = card.get("tap_action") or {}
+    if t == "picture-elements":
+        return "rig"
+    if t == "tile":
+        return "heat" if ent == HEAT else ("select" if ent.startswith("select.") else "tile")
+    if t == "custom:mushroom-template-card":
+        target = (tap.get("target") or {}).get("entity_id", "")
+        if target == f"button.{P}_start_session":
+            return "action_primary"
+        if target in (f"button.{P}_boost_session", f"button.{P}_abort_session"):
+            return "action"
+        if card.get("layout") == "vertical":
+            return "stat"
+        if ent.startswith(f"light.{P}_profile_"):
+            return "tile"
+        if card.get("badge_color") == "orange":  # the four profile cards
+            return "profile"
+        return "tile"
+    if t == "sensor":
+        return "sensor"
+    if t == "custom:mushroom-chips-card":
+        return "chips"
+    if t == "custom:mushroom-light-card":
+        return "light"
+    if t == "entities":
+        return "entities"
+    if t == "conditional":
+        return None
+    return None
+
+
+def decorate(view):
+    """Daybreak skin: no theme (so card_mod applies), page background, banner headers, per-role card_mod."""
+    try:
+        import peak_style
+    except ImportError:
+        return view
+    try:
+        from peak_rig import _url
+    except ImportError:
+        _url = None
+    view.pop("theme", None)
+    if getattr(peak_style, "VIEW_BACKGROUND", None):
+        view["background"] = peak_style.VIEW_BACKGROUND
+    for sec in view["sections"]:
+        cards = []
+        for c in sec["cards"]:
+            if c.get("type") == "heading" and c.get("heading_style") == "title" and c["heading"] in BANNERS and _url:
+                try:
+                    url = _url(BANNERS[c["heading"]])
+                except KeyError:
+                    cards.append(c)
+                    continue
+                b = peak_style.banner_card(url)
+                b["grid_options"] = {"columns": "full"}
+                if c.get("badges"):  # keep the live badges as a slim heading under the banner
+                    cards.append(b)
+                    cards.append({"type": "heading", "heading": "", "heading_style": "subtitle", "badges": c["badges"]})
+                    continue
+                cards.append(b)
+                continue
+            role = _role(c)
+            if c.get("type") == "tile" and c.get("entity") != HEAT and "color" not in c:
+                # default tile icons are HA blue; info tiles go neutral, interactive ones ember
+                c["color"] = "orange" if c.get("entity", "").split(".")[0] in ("select", "light", "button") else "grey"
+            if role == "profile":
+                n = int(c["icon"].rsplit("-", 2)[1])  # mdi:numeric-N-circle
+                c = peak_style.style(c, role, n=n)
+            elif role:
+                c = peak_style.style(c, role)
+            if c.get("type") == "conditional" and "card" in c:
+                r = _role(c["card"])
+                if r:
+                    c["card"] = peak_style.style(c["card"], r)
+            cards.append(c)
+        sec["cards"] = cards
+    return view
+
+
+def peak_view():
+    return decorate(_plain_view())
 
 
 # --------------------------------------------------------------------- home spot
