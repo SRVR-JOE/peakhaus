@@ -127,6 +127,19 @@ globals:
   - id: temp_ref_ms
     type: uint32_t
     initial_value: '0'
+  # ---- [v10] ----
+  - id: preset_flash_ms    # millis() when a preset was fired from the presets page (ember sweep)
+    type: uint32_t
+    initial_value: '0'
+  - id: hits_prev          # last counter.peak_hits_today value seen (-1 = none yet since boot)
+    type: int
+    initial_value: '-1'
+  - id: day_n              # entries used in day_hits
+    type: int
+    initial_value: '0'
+  - id: day_hits           # minute-of-day of each hit logged on the Dial since boot / the 06:00 reset
+    type: std::array<int16_t, 64>
+    initial_value: 'std::array<int16_t, 64>{}'
 
 sensor:
   - platform: wifi_signal
@@ -158,6 +171,25 @@ sensor:
   - platform: homeassistant
     id: peak_per_day
     entity_id: sensor.peak_pro_02743_dabs_per_day
+  # [v10] hits since 06:00 (HA counter, reset by automation); each increase is logged for the Day face
+  - platform: homeassistant
+    id: hits_today
+    entity_id: counter.peak_hits_today
+    on_value:
+      - lambda: |-
+          if (isnan(x)) return;
+          int v = (int) lroundf(x);
+          int prev = id(hits_prev);
+          if (v == 0 || (prev >= 0 && v < prev)) {
+            id(day_n) = 0;
+          } else if (prev >= 0 && v > prev) {
+            auto t = id(ha_time).now();
+            if (t.is_valid()) {
+              int md = t.hour * 60 + t.minute;
+              for (int k = prev; k < v && id(day_n) < 64; k++) id(day_hits)[id(day_n)++] = md;
+            }
+          }
+          id(hits_prev) = v;
   - platform: homeassistant
     id: d1
     entity_id: number.peak_pro_02743_profile_1_duration
@@ -266,6 +298,7 @@ select:
       - Fuel & Temp
       - Session
       - Thermo
+      - Day
     initial_option: Race Tach
     optimistic: true
     restore_value: true
@@ -318,7 +351,7 @@ binary_sensor:
                       option: "{{ opt }}"
                     variables:
                       opt: 'return to_string(id(preset_sel));'
-                - lambda: 'id(page) = 0; id(preset_sel) = 0;'
+                - lambda: 'id(page) = 0; id(preset_sel) = 0; id(preset_flash_ms) = millis(); id(ui_anim) = true;'
               else:
                 - if:
                     condition:
@@ -328,7 +361,7 @@ binary_sensor:
                           action: button.press
                           data:
                             entity_id: button.peak_pro_02743_boost_session
-                      - lambda: 'id(page) = 0; id(preset_sel) = 0;'
+                      - lambda: 'id(page) = 0; id(preset_sel) = 0; id(preset_flash_ms) = millis(); id(ui_anim) = true;'
                     else:
                       - lambda: 'id(page) = (id(page) + 1) % 3; id(preset_sel) = 0;'
           - component.update: lcd
@@ -344,6 +377,10 @@ text_sensor:
   - platform: homeassistant
     id: peak_profile
     entity_id: select.peak_pro_02743_active_profile
+  # [v10] the Peak's own operating state (sleep, idle, heat_cycle_*, ...); empty/unknown when HA lacks it
+  - platform: homeassistant
+    id: peak_opstate
+    entity_id: sensor.peak_pro_02743_operating_state
   # [presets] profile LED colours, "[r, g, b]" strings parsed at draw time
   - platform: homeassistant
     id: pc1
@@ -415,7 +452,15 @@ interval:
 
           // ---- backlight dim / wake ----
           bool idle = (now - id(last_touch_ms)) > 60000;
-          bool want_dim = idle && !id(peak_awake).state && !id(peak_heating).state;
+          // [v10] prefer the Peak's operating state; fall back to the awake flag when HA doesn't have it
+          const std::string &os = id(peak_opstate).state;
+          bool known = !os.empty() && os != "unknown" && os != "unavailable";
+          bool asleep = known ? (os == "sleep" || os == "master_off") : !id(peak_awake).state;
+          bool heat = id(peak_heating).state || os.rfind("heat_cycle", 0) == 0;
+          // [v10] night mode: 00:00-06:00 the face dims after 60 s idle even if the Peak is awake
+          auto tn = id(ha_time).now();
+          bool night = tn.is_valid() && tn.hour < 6;
+          bool want_dim = idle && !heat && (asleep || night);
           if (want_dim && !id(screen_dim)) {
             id(screen_dim) = true;
             auto call = id(backlight).turn_on();
@@ -705,8 +750,14 @@ display:
       // ---------- data ----------
       float T = id(peak_temp).state;
       bool hasT = !isnan(T);
-      bool heating = id(peak_heating).state;
-      bool awake = id(peak_awake).state;
+      // [v10] operating state when HA has it, else the switch / awake flag
+      const std::string &opst = id(peak_opstate).state;
+      bool op_known = !opst.empty() && opst != "unknown" && opst != "unavailable";
+      bool heating = id(peak_heating).state || opst.rfind("heat_cycle", 0) == 0;
+      bool awake = op_known ? !(opst == "sleep" || opst == "master_off") : id(peak_awake).state;
+      float hits = id(hits_today).state;
+      char hits_s[16];
+      if (isnan(hits)) hits_s[0] = 0; else snprintf(hits_s, sizeof(hits_s), "%d today", (int) lroundf(hits));
       float batt = id(peak_batt).state;
       int cur = atoi(id(peak_profile).state.c_str());
       if (cur < 1 || cur > 4) cur = 0;
@@ -865,9 +916,11 @@ display:
         if (isnan(td)) snprintf(b, sizeof(b), "--"); else snprintf(b, sizeof(b), "%d", (int) lroundf(td));
         it.print(cx, 114, id(f_num), id(c_fg), TextAlign::BASELINE_CENTER, b);
         it.horizontal_line(cx - 18, 133, 36, id(c_seg));
-        if (isnan(pd)) snprintf(b, sizeof(b), "--"); else snprintf(b, sizeof(b), "%.1f", pd);
+        if (isnan(hits)) snprintf(b, sizeof(b), "--"); else snprintf(b, sizeof(b), "%d", (int) lroundf(hits));
         it.print(cx, 154, id(f_title), id(c_fg), TextAlign::CENTER, b);
-        it.print(cx, 177, id(f_label), id(c_dim), TextAlign::CENTER, "per day");
+        char pdl[24];
+        if (isnan(pd)) snprintf(pdl, sizeof(pdl), "today"); else snprintf(pdl, sizeof(pdl), "today  ·  %.1f / day", pd);
+        it.print(cx, 177, id(f_label), id(c_dim), TextAlign::CENTER, pdl);
         batt_text(200, id(c_mid));
         return;
       }
@@ -933,6 +986,18 @@ display:
         return;
       }
 
+      // ================= PRESET FIRED (transient, 600 ms ember sweep) =================
+      if (id(preset_flash_ms) != 0 && (now - id(preset_flash_ms)) < 600) {
+        float k = (now - id(preset_flash_ms)) / 600.0f;
+        k = k * k * (3.0f - 2.0f * k);
+        dial_ticks(id(c_tick), id(c_tick_major));
+        arc(R_IN, R_OUT, A0, A0 + SWEEP, id(c_track), Color::BLACK);
+        arc(R_IN, R_OUT, A0, A0 + SWEEP * k, id(c_heat), id(c_track));
+        if (cur) fit(112, id(f_title), id(f_body), id(c_fg), pname(cur).c_str(), 180);
+        id(ui_anim) = true;
+        return;
+      }
+
       // ================= FACES (Gauge Style select) =================
       auto ai = id(face).active_index();
       int style = ai.has_value() ? (int) *ai : 0;
@@ -990,6 +1055,7 @@ display:
         if (hasT) it.printf(cx, 172, id(f_body), t.win_fg, TextAlign::CENTER, "%d°F", (int) lroundf(Td), t.win_bg);
         else it.print(cx, 172, id(f_body), t.win_fg, TextAlign::CENTER, "--", t.win_bg);
         if (cur) it.print(cx, 196, id(f_label), t.label, TextAlign::CENTER, pname(cur).c_str(), t.face);
+        if (hits_s[0]) it.print(cx, 211, id(f_label), t.label, TextAlign::CENTER, hits_s, t.face);
         // startup sweep: needle runs to the stop and back (boot / face selected)
         float nv = Td;
         bool needle = hasT;
@@ -1061,6 +1127,7 @@ display:
         if (hasT) nline(60.0f, 96.0f, 45.0f - 90.0f * fminf(fmaxf(Td, 0.0f), 700.0f) / 700.0f, 1.5f, heating ? id(c_heat) : id(c_fg));
         it.print(cx, 26, id(f_label), id(c_dim), TextAlign::CENTER, "Fuel  ·  Temp");
         it.image(cx, 36, id(mark), ImageAlign::TOP_CENTER, id(c_mid), Color::BLACK);
+        if (hits_s[0]) it.print(cx, 70, id(f_label), id(c_dim), TextAlign::CENTER, hits_s);
         const Color win(14, 14, 14);
         it.filled_rectangle(68, 86, 104, 46, win);
         it.rectangle(68, 86, 104, 46, id(c_seg));
@@ -1104,6 +1171,7 @@ display:
         if (hasT) it.printf(52, 100, id(f_num), heating ? id(c_heat) : id(c_fg), TextAlign::CENTER, "%d", (int) lroundf(Td));
         else it.print(52, 100, id(f_num), id(c_mid), TextAlign::CENTER, "--");
         it.print(52, 126, id(f_label), id(c_dim), TextAlign::CENTER, "°F");
+        if (hits_s[0]) it.print(52, 152, id(f_label), id(c_dim), TextAlign::CENTER, hits_s);
         char sb[40];
         if (heating && !isnan(rem)) snprintf(sb, sizeof(sb), "%s · %d s", holding ? "Ready" : "Heating", (int) lroundf(fmaxf(rem, 0.0f)));
         else if (heating) snprintf(sb, sizeof(sb), "Heating");
@@ -1112,6 +1180,40 @@ display:
         fit(214, id(f_label), id(f_label), heating ? id(c_heat) : id(c_mid), sb, 200);
         batt_text(196, id(c_dim));
         it.image(cx, 8, id(mark), ImageAlign::TOP_CENTER, id(c_mid), Color::BLACK);
+        return;
+      }
+
+      if (style == 6) {
+        // ---------- DAY: 6 am (135°) to midnight (405°) on the main 270° sweep ----------
+        auto dang = [&](int m) { return A0 + SWEEP * fminf(fmaxf(m / 1080.0f, 0.0f), 1.0f); };
+        arc(R_IN, R_OUT, A0, A0 + SWEEP, id(c_track), Color::BLACK);
+        ticks(108.0f, 113.0f, 106.0f, A0, SWEEP / 18.0f, 19, 3, 1.4f, id(c_tick), id(c_tick_major));
+        const char *HL[7] = {"6a", "9a", "12p", "3p", "6p", "9p", "12a"};
+        for (int i = 0; i < 7; i++) {
+          int x, y;
+          pt(86.0f, dang(i * 180), x, y);
+          it.print(x, y, id(f_label), id(c_dim), TextAlign::CENTER, HL[i]);
+        }
+        for (int i = 0; i < id(day_n); i++) {
+          int m = id(day_hits)[i] - 360;
+          if (m < 0) m += 1440;
+          if (m <= 1080) nline(96.0f, 109.0f, dang(m), 1.2f, id(c_heat));
+        }
+        auto tn = id(ha_time).now();
+        if (tn.is_valid()) {
+          int m = tn.hour * 60 + tn.minute - 360;
+          if (m < 0) m += 1440;
+          if (m <= 1080) nline(94.0f, 113.0f, dang(m), 1.0f, id(c_fg));
+        }
+        it.image(cx, 44, id(mark), ImageAlign::TOP_CENTER, id(c_mid), Color::BLACK);
+        if (isnan(hits)) it.print(cx, 108, id(f_temp), id(c_mid), TextAlign::CENTER, "--");
+        else it.printf(cx, 108, id(f_temp), id(c_fg), TextAlign::CENTER, "%d", (int) lroundf(hits));
+        it.print(cx, 148, id(f_label), id(c_mid), TextAlign::CENTER, "hits today");
+        char sb[32];
+        if (!isnan(batt) && hasT) snprintf(sb, sizeof(sb), "%d %%  ·  %d °F", (int) lroundf(batt), (int) lroundf(Td));
+        else if (!isnan(batt)) snprintf(sb, sizeof(sb), "%d %%", (int) lroundf(batt));
+        else sb[0] = 0;
+        if (sb[0]) it.print(cx, 196, id(f_label), id(c_dim), TextAlign::CENTER, sb);
         return;
       }
 
@@ -1140,4 +1242,5 @@ display:
         it.print(cx, 146, id(f_label), id(c_mid), TextAlign::CENTER, isnan(tgt) ? "°F heater" : "°F target");
         it.print(cx, 172, id(f_label), id(c_dim), TextAlign::CENTER, awake ? "Ready in about 45 s" : "Asleep");
       }
+      if (hits_s[0]) it.print(cx, 191, id(f_label), id(c_dim), TextAlign::CENTER, hits_s);
       batt_text(206, id(c_dim));

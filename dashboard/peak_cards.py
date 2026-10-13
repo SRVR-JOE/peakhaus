@@ -141,6 +141,71 @@ def _day_chart(kind):
                 grid_options={"columns": "full"})
 
 
+def _week_chart():
+    """Hits per day for the last 7 days (today on the right), same skin as the day charts."""
+    apex = {k: (dict(v) if isinstance(v, dict) else v) for k, v in _DAY_APEX.items()}
+    apex["chart"]["height"] = 130
+    apex["xaxis"] = dict(apex["xaxis"], labels=dict(apex["xaxis"]["labels"], datetimeFormatter={"day": "ddd"}))
+    apex["dataLabels"] = {"style": {"colors": ["#ececec"], "fontSize": "11px"}, "offsetY": -18,
+                          "background": {"enabled": False}, "dropShadow": {"enabled": False},
+                          "formatter": "EVAL:function(v){ return v > 0 ? v : ''; }"}
+    apex["plotOptions"] = {"bar": {"columnWidth": "60%", "borderRadius": 2, "dataLabels": {"position": "top"}}}
+    return {
+        "type": "custom:apexcharts-card",
+        "graph_span": "7d",
+        "span": {"end": "day"},
+        "header": {"show": False},
+        "apex_config": apex,
+        "yaxis": [{"id": "y", "min": 0, "decimals": 0,
+                   "apex_config": {"tickAmount": 2, "forceNiceScale": True,
+                                   "labels": {"minWidth": 28, "maxWidth": 28, "style": {"colors": "#6b6f76"}}}}],
+        "series": [{
+            "entity": f"sensor.{P}_total_dabs", "name": "Hits", "type": "column",
+            "color": "#ff7a1a", "yaxis_id": "y",
+            "group_by": {"func": "diff", "duration": "1d"},
+            "show": {"datalabels": True, "legend_value": False},
+        }],
+        "grid_options": {"columns": "full"},
+    }
+
+
+def _tach_card():
+    """Race Tach heater gauge: face art + needle rotated by card_mod + per-profile redline + digital readout."""
+    try:
+        from peak_rig import _url
+        face, needle = _url("peak/tach_face"), _url("peak/tach_needle")
+        red = {n: _url(f"peak/tach_redline_p{n}") for n in range(1, 5)}
+    except (ImportError, KeyError):
+        return {"type": "sensor", "entity": TEMP, "name": "Heater", "graph": "line", "hours_to_show": 24,
+                "detail": 2, "unit": "°F", "grid_options": {"columns": "full"}}
+    full = {"left": "50%", "top": "50%", "width": "100%", "pointer-events": "none"}
+    elements = [
+        {"type": "conditional", "conditions": [{"entity": PROFILE, "state": str(n)}],
+         "elements": [{"type": "image", "image": red[n], "tap_action": {"action": "none"},
+                       "hold_action": {"action": "none"}, "style": dict(full)}]}
+        for n in range(1, 5)
+    ]
+    elements.append({   # needle art points at 0; rotate clockwise by temp/700 x 270 deg about the face centre
+        "type": "image", "image": needle, "tap_action": {"action": "none"}, "hold_action": {"action": "none"},
+        "style": dict(full, transform="translate(-50%, -50%) rotate(var(--peak-needle, 0deg))",
+                      transition="transform 0.8s ease-out"),
+    })
+    elements.append({
+        "type": "state-label", "entity": TEMP,
+        "style": {"left": "50%", "top": "80%", "color": "#ececec", "font-size": "28px", "font-weight": "300",
+                  "font-variant-numeric": "tabular-nums", "white-space": "nowrap"},
+    })
+    deg = f"{{{{ ([states('{TEMP}') | float(0), 700] | min) / 700 * 270 }}}}"
+    return {
+        "type": "picture-elements",
+        "image": face,
+        "elements": elements,
+        "tap_action": {"action": "more-info", "entity": TEMP},
+        "card_mod": {"style": "ha-card { --peak-needle: " + deg + "deg; }"},
+        "grid_options": {"columns": "full"},
+    }
+
+
 def session_section():
     action_btn = lambda name, icon, entity, color: {
         "type": "custom:mushroom-template-card",
@@ -165,19 +230,23 @@ def session_section():
                 "conditions": [{"condition": "state", "entity": HEAT, "state": "on"}],
                 "card": _tile(REMAIN, "Time left", icon="mdi:timer-outline"),
             },
-            {
-                "type": "sensor",
-                "entity": TEMP,
-                "name": "Heater",
-                "graph": "line",
+            _tach_card(),
+            {   # slim 24 h heater trace under the tach so the history isn't lost
+                "type": "custom:mini-graph-card",
+                "entities": [{"entity": TEMP, "color": "#ff7a1a"}],
                 "hours_to_show": 24,
-                "detail": 2,
-                "unit": "°F",
+                "points_per_hour": 6,
+                "line_width": 2,
+                "height": 60,
+                "show": {"name": False, "icon": False, "state": False, "legend": False, "fill": "fade",
+                         "labels": False, "points": False},
                 "grid_options": {"columns": "full"},
             },
             _heading("Today, 6 am to midnight", style="subtitle"),
             _day_chart("hits"),
             _day_chart("sessions"),
+            _heading("This week", style="subtitle"),
+            _week_chart(),
         ],
     }
 
@@ -237,7 +306,7 @@ def battery_usage_section():
         "layout": "vertical",
         "entity": entity,
         "tap_action": {"action": "more-info"},
-        "grid_options": {"columns": 4},
+        "grid_options": {"columns": 3},
     }
     return {
         "type": "grid",
@@ -253,7 +322,9 @@ def battery_usage_section():
                 "unit": "%",
                 "grid_options": {"columns": "full"},
             },
-            stat("Dabs per day", f"sensor.{P}_dabs_per_day", "mdi:calendar-today",
+            stat("Hits today", "counter.peak_hits_today", "mdi:fire",
+                 "{{ states('counter.peak_hits_today') | int(0) }}"),
+            stat("Per day", f"sensor.{P}_dabs_per_day", "mdi:calendar-today",
                  f"{{{{ states('sensor.{P}_dabs_per_day') | float(0) | round(1) }}}}"),
             stat("Total dabs", f"sensor.{P}_total_dabs", "mdi:counter",
                  f"{{{{ states('sensor.{P}_total_dabs') | int(0) }}}}"),

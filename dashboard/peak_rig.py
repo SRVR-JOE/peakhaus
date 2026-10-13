@@ -62,5 +62,7 @@ def rig_card(heat_entity="switch.peak_pro_02743_heat_session",
         "type": "picture-elements",
         "image": RIG_BG,
         "elements": elements,
+        # on phones the portrait art would fill a whole screen; shrink the card (overlays scale with it)
+        "card_mod": {"style": "@media (max-width: 600px) { ha-card { max-width: 240px; margin: 0 auto; } }"},
         "grid_options": {"columns": "full"},
     }

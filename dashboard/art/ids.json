@@ -50,5 +50,29 @@
  "peak/peak_rig_none": {
   "id": "35eec54d7932887ba33e2f88d637a814",
   "sha1": "35534665e2c5ec21e67e21d6b88a70d5cb3fdb03"
+ },
+ "peak/tach_face": {
+  "id": "01d12399830a0158e8204a741be08993",
+  "sha1": "cd263ff9e32d13d0f0c42b641e7d9dd81bb277f3"
+ },
+ "peak/tach_needle": {
+  "id": "c4f5ee9baeb8e3a2e9ec505447906890",
+  "sha1": "71c5cd53cbca8b9843fe192036529f382c6da0f2"
+ },
+ "peak/tach_redline_p1": {
+  "id": "5d946ba86712f9e810f1a932badf8629",
+  "sha1": "768fae1721eafb220d3501832b65762b11018e80"
+ },
+ "peak/tach_redline_p2": {
+  "id": "82df30140cbd1b648e149f1631c70478",
+  "sha1": "7d13b203802ce41d817b398f908c66f4ca477f16"
+ },
+ "peak/tach_redline_p3": {
+  "id": "69e4f45503379d1f1a5287e5c4a8d933",
+  "sha1": "d4e545c392cb79f60a4ea43476fe442e5a74432f"
+ },
+ "peak/tach_redline_p4": {
+  "id": "1f1a5f1293022748194ea1863e93232a",
+  "sha1": "226111dfb304e9dc537aa1a2e1ac2cec872da1f9"
  }
 }
