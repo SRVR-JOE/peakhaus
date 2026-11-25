@@ -2,7 +2,7 @@
 
 Upstream history (HA-Puff/home-assistant-puffco up to 1.1.24) is in docs/UPSTREAM-CHANGELOG.md.
 
-## [Unreleased] — auto-reconnect
+## [1.2.1] - 2026-11-25 — auto-reconnect
 
 ### Fixed
 
