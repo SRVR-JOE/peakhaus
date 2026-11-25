@@ -1,0 +1,10 @@
+# Test-only deps (not needed by HA). Python 3.13+.
+pytest
+homeassistant==2026.11.2
+bleak
+bleak-retry-connector
+habluetooth
+# homeassistant.components.bluetooth imports these at module load
+aiousbwatcher
+aiohasupervisor
+serialx
