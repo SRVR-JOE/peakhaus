@@ -2,6 +2,12 @@
 
 Upstream history (HA-Puff/home-assistant-puffco up to 1.1.24) is in docs/UPSTREAM-CHANGELOG.md.
 
+## [1.2.2] - 2026-11-25
+
+### Changed
+
+- Heater temperature is read every 1 s during a heat cycle (was 2 s), so remotes and gauges track the real temperature more closely.
+
 ## [1.2.1] - 2026-11-25 — auto-reconnect
 
 ### Fixed

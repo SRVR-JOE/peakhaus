@@ -55,7 +55,7 @@ DEFAULT_SCAN_INTERVAL = 60
 # connects (it no longer advertises), so this keeps sensors fresh.
 POLL_INTERVAL = 10
 # Faster poll while preheating / heating / cooling down after a dab.
-HEAT_POLL_INTERVAL = 2
+HEAT_POLL_INTERVAL = 1
 HEAT_CYCLE_STATES = frozenset(
     {
         "heat_cycle_preheat",
