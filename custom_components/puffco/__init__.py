@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import sys
@@ -22,6 +23,7 @@ from .const import (
     DEFAULT_SHOW_DIAGNOSTICS,
     DIAGNOSTIC_ENTITY_SUFFIXES,
     DOMAIN,
+    SHUTDOWN_TIMEOUT,
 )
 from .coordinator import PuffcoDataUpdateCoordinator
 from .service_handlers import async_setup_services
@@ -93,7 +95,23 @@ def _async_apply_entity_registry(hass: HomeAssistant, entry: ConfigEntry) -> Non
 
 
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
-    if unload_ok := await hass.config_entries.async_unload_platforms(entry, PLATFORMS):
-        coordinator: PuffcoDataUpdateCoordinator = hass.data[DOMAIN].pop(entry.entry_id)
-        await coordinator.async_shutdown()
+    unload_ok = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
+    if not unload_ok:
+        return False
+    coordinator: PuffcoDataUpdateCoordinator | None = hass.data.get(DOMAIN, {}).pop(
+        entry.entry_id, None
+    )
+    if coordinator is not None:
+        # Never let BLE teardown fail the unload: an exception or hang here
+        # leaves the entry in failed_unload, which only an HA restart clears.
+        # A wedged proxy connection just gets abandoned.
+        try:
+            async with asyncio.timeout(SHUTDOWN_TIMEOUT):
+                await coordinator.async_shutdown()
+        except Exception:  # noqa: BLE001
+            _LOGGER.warning(
+                "Puffco %s: BLE teardown did not finish cleanly; continuing unload",
+                entry.title,
+                exc_info=True,
+            )
     return unload_ok

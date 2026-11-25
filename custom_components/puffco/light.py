@@ -173,13 +173,13 @@ class PuffcoLanternLight(PuffcoControllableEntity, LightEntity):
                 clamped = clamp_brightness(self.coordinator.data.lantern_brightness)
                 if clamped is not None:
                     self._attr_brightness = clamped
-            client = (
-                self.coordinator._client.bleak  # noqa: SLF001
-                if self.coordinator._client
-                else None
-            )
-            if client and client.lantern_color:
-                parsed = self._parse_lantern_color(client.lantern_color)
+            # PuffcoClient.bleak raises RuntimeError while disconnected. This
+            # runs inside the coordinator's advertisement/disconnect callbacks,
+            # so raising here used to abort them before they could schedule a
+            # reconnect — read the colour only when a session is up.
+            lantern_color = self.coordinator.lantern_color
+            if lantern_color:
+                parsed = self._parse_lantern_color(lantern_color)
                 if parsed:
                     self._rgb, self._effect = parsed
         super()._handle_coordinator_update()

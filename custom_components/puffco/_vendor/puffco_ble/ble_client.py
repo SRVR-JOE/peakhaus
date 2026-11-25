@@ -722,7 +722,14 @@ class PuffcoBleakClient(BleakClient):
         path_bytes = path.encode() if isinstance(path, str) else path
         return bytes(header.data + path_bytes)
 
-    async def lorax_read_short(self, path: str) -> bytearray:
+    async def lorax_read_short(
+        self, path: str, *, timeout: float = GATT_READ_TIMEOUT
+    ) -> bytearray:
+        # Fail fast on a dead link: the reply arrives as a notification, so a
+        # dropped GATT session (proxy reboot, Peak asleep) would otherwise leave
+        # this waiting forever while the caller holds the coordinator lock.
+        if not self.is_connected:
+            raise BleakError(f"Lorax read of {path} while not connected")
         resp = Event()
         payload = self._read_short_cmd(self.max_payload, path)
         tx = self._make_transaction(
@@ -733,8 +740,15 @@ class PuffcoBleakClient(BleakClient):
                 LoraxCharacteristics.LORAX_COMMAND, tx["cmd"], response=False
             )
         )
-        await resp.wait()
-        result = self.transaction_responses.pop(f"{tx['sequenceId']}-{path}")
+        try:
+            await wait_for(resp.wait(), timeout=timeout)
+        except TimeoutError as err:
+            self.transactions.pop(tx["sequenceId"], None)
+            self.transaction_responses.pop(f"{tx['sequenceId']}-{path}", None)
+            raise BleakError(
+                f"Lorax read of {path} timed out after {timeout:.0f}s"
+            ) from err
+        result = self.transaction_responses.pop(f"{tx['sequenceId']}-{path}", None)
         if result is None:
             raise BleakError(f"Lorax read failed for path {path}")
         if isinstance(result, (bytes, bytearray)):

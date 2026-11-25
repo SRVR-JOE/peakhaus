@@ -6,7 +6,8 @@ import asyncio
 import contextlib
 import logging
 import math
-from collections.abc import Awaitable, Callable
+import time
+from collections.abc import AsyncIterator, Awaitable, Callable, Coroutine
 from dataclasses import replace
 from functools import partial
 from datetime import datetime, timedelta
@@ -41,6 +42,7 @@ from .const import (
     DEFAULT_SCAN_INTERVAL,
     DEFAULT_IDLE_DISCONNECT,
     DEFAULT_WAKE_ON_COMMAND,
+    DISCONNECT_TIMEOUT,
     DOMAIN,
     ATTR_OPERATING_STATE,
     EVENT_CHARGING_STARTED,
@@ -51,6 +53,9 @@ from .const import (
     HEAT_CYCLE_STATES,
     HEAT_POLL_INTERVAL,
     IDLE_DISCONNECT_SECONDS,
+    LOCK_ACQUIRE_TIMEOUT,
+    LOCKED_CONNECT_TIMEOUT,
+    LOCKED_GATT_TIMEOUT,
     POLL_INTERVAL,
     RECONNECT_INTERVAL,
     RECONNECT_MAX_ATTEMPTS,
@@ -58,6 +63,7 @@ from .const import (
     RECONNECT_WAKE_DELAY_ADVERTISING,
     SESSION_START_POLL_ATTEMPTS,
     SESSION_START_POLL_INTERVAL,
+    SHUTDOWN_TIMEOUT,
     WAKE_ON_COMMAND_POLL,
     WAKE_ON_COMMAND_TIMEOUT,
     is_heat_cycle_state,
@@ -70,11 +76,18 @@ from puffco_ble.models import PuffcoData
 _LOGGER = logging.getLogger(__name__)
 
 DEVICE_STARTUP_TIMEOUT = 30
+# Seconds without an advertisement after which the next one counts as news
+# and interrupts a reconnect worker's backoff.
+ADVERT_GAP_IS_NEWS = 20.0
 VALIDATE_TIMEOUT = 45
 
 
 class CannotConnect(HomeAssistantError):
     """Error to indicate we cannot connect."""
+
+
+class BleOperationTimeout(HomeAssistantError):
+    """A locked BLE operation (or the wait for the lock) exceeded its budget."""
 
 
 def _make_connector(
@@ -178,6 +191,14 @@ class PuffcoDataUpdateCoordinator(ActiveBluetoothDataUpdateCoordinator[PuffcoDat
         self._interval_poll_task: asyncio.Task | None = None
         self._pending_ble_device: BLEDevice | None = None
         self._reconnect_failures = 0
+        # Set by a fresh advertisement / disconnect so a reconnect worker that
+        # is sleeping between attempts retries immediately instead of waiting
+        # out its backoff.
+        self._wake_event = asyncio.Event()
+        self._waiting_for_advert = False
+        self._last_advert_source: str | None = None
+        self._last_advert_at: float | None = None
+        self._shutting_down = False
         self._session_listeners: list[Callable[[str, dict], None]] = []
         self._previous_charging: bool | None = None
         self._previous_on_dock: bool | None = None
@@ -206,6 +227,102 @@ class PuffcoDataUpdateCoordinator(ActiveBluetoothDataUpdateCoordinator[PuffcoDat
     def ble_connected(self) -> bool:
         """True when a live authenticated BLE session is up."""
         return self._ble_connected and self._client.is_connected
+
+    @property
+    def lantern_color(self) -> bytearray | None:
+        """Last lantern colour read over BLE, or None without a live session."""
+        if not self._client.is_connected:
+            return None
+        return self._client.bleak.lantern_color
+
+    @callback
+    def async_update_listeners(self) -> None:
+        """Push to entities without letting one bad entity abort the caller.
+
+        This runs inside the Bluetooth advertisement, unavailable and
+        disconnect callbacks. An entity raising here (it happened: the lantern
+        light read ``PuffcoClient.bleak`` while disconnected) used to abort
+        those callbacks before they scheduled a reconnect, so the Peak sat
+        advertising until the entry was reloaded.
+        """
+        try:
+            super().async_update_listeners()
+        except Exception:  # noqa: BLE001
+            _LOGGER.exception("%s: entity update failed; continuing", self.mac)
+
+    @callback
+    def _async_create_task(
+        self, coro: Coroutine, name: str
+    ) -> asyncio.Task:
+        """Background task owned by the config entry (cancelled on unload)."""
+        return self.config_entry.async_create_background_task(
+            self.hass, coro, f"puffco {self.mac} {name}"
+        )
+
+    @contextlib.asynccontextmanager
+    async def _ble_op(
+        self, name: str, timeout: float | None = None
+    ) -> AsyncIterator[None]:
+        """Hold the BLE lock for at most ``timeout`` seconds.
+
+        ``timeout=None`` picks the connect budget when no session is up (the
+        body will have to connect) and the GATT budget otherwise. A body that
+        overruns is cancelled, the link is force-dropped and the lock released,
+        so one hung GATT op can no longer wedge the reconnect worker, the
+        Reconnect button and every later command.
+        """
+        try:
+            async with asyncio.timeout(LOCK_ACQUIRE_TIMEOUT):
+                await self._lock.acquire()
+        except TimeoutError as err:
+            _LOGGER.warning(
+                "%s: %s gave up waiting %.0fs for the BLE lock",
+                self.mac,
+                name,
+                LOCK_ACQUIRE_TIMEOUT,
+            )
+            raise BleOperationTimeout(
+                f"Puffco BLE busy; {name} timed out waiting for the link"
+            ) from err
+        try:
+            if timeout is None:
+                timeout = (
+                    LOCKED_GATT_TIMEOUT
+                    if self._client.is_connected
+                    else LOCKED_CONNECT_TIMEOUT
+                )
+            budget = asyncio.timeout(timeout)
+            try:
+                async with budget:
+                    yield
+            except TimeoutError as err:
+                if not budget.expired():
+                    # A TimeoutError from the body itself (e.g. bleak connect).
+                    raise
+                _LOGGER.warning(
+                    "%s: %s hung for %.0fs; dropping the BLE link",
+                    self.mac,
+                    name,
+                    timeout,
+                )
+                self._ble_connected = False
+                self._needs_reconnect = True
+                await self._async_force_disconnect()
+                raise BleOperationTimeout(
+                    f"Puffco {name} timed out after {timeout:.0f}s"
+                ) from err
+        finally:
+            self._lock.release()
+
+    async def _async_force_disconnect(self) -> None:
+        """Drop the GATT session, bounded; never raises (caller holds the lock)."""
+        try:
+            async with asyncio.timeout(DISCONNECT_TIMEOUT):
+                await self._client.disconnect()
+        except asyncio.CancelledError:
+            raise
+        except Exception as err:  # noqa: BLE001
+            _LOGGER.debug("%s: disconnect failed/timed out: %s", self.mac, err)
 
     @property
     def is_advertising(self) -> bool:
@@ -601,13 +718,15 @@ class PuffcoDataUpdateCoordinator(ActiveBluetoothDataUpdateCoordinator[PuffcoDat
             EVENT_DISCONNECTED,
             {"device_id": device.id if device else None, "mac": self.mac},
         )
-        self._logbook("Bluetooth disconnected")
-        self.async_update_listeners()
+        # Schedule before touching entities so nothing they do can skip it.
         # Only reconnect immediately when the Peak is still advertising (link
-        # flutter). If it went to sleep, wait for a wake advert instead of
-        # hammering BLE — that stale reconnect loop often needs pairing mode.
+        # flutter). If it went to sleep (or the proxy went away) the next
+        # advertisement — via _async_handle_bluetooth_event — or the
+        # RECONNECT_INTERVAL tick brings it back.
         if self._advertising:
             self._schedule_reconnect()
+        self._logbook("Bluetooth disconnected")
+        self.async_update_listeners()
 
     @callback
     def _sync_link_state(self) -> None:
@@ -644,28 +763,52 @@ class PuffcoDataUpdateCoordinator(ActiveBluetoothDataUpdateCoordinator[PuffcoDat
             self.mac,
             IDLE_DISCONNECT_SECONDS,
         )
-        async with self._lock:
-            if not self._client.is_connected:
+        try:
+            async with self._ble_op("idle disconnect", LOCKED_GATT_TIMEOUT):
+                if not self._client.is_connected:
+                    self._ble_connected = False
+                    self._needs_reconnect = True
+                    self.async_update_listeners()
+                    return
                 self._ble_connected = False
                 self._needs_reconnect = True
-                self.async_update_listeners()
-                return
-            self._ble_connected = False
-            self._needs_reconnect = True
-            self._advertising = False
-            await self._client.disconnect()
+                self._advertising = False
+                await self._async_force_disconnect()
+        except BleOperationTimeout:
+            pass
         self.async_update_listeners()
 
     @callback
-    def _schedule_reconnect(self, device: BLEDevice | None = None) -> None:
+    def _schedule_reconnect(
+        self, device: BLEDevice | None = None, *, wake: bool = False
+    ) -> None:
         """Queue a reconnect attempt (waits for lock; never skipped)."""
         if device is not None:
             self._pending_ble_device = device
-        if self.hass.is_stopping:
+        if self.hass.is_stopping or self._shutting_down:
             return
         if self._reconnect_task is not None and not self._reconnect_task.done():
+            # A worker is already running. When this advert is news (the Peak
+            # was invisible, or it is now heard via a different / restarted
+            # proxy) cut the worker's backoff short instead of waiting it out.
+            if wake or self._waiting_for_advert:
+                self._wake_event.set()
             return
-        self._reconnect_task = self.hass.async_create_task(self._async_reconnect_worker())
+        self._wake_event.clear()
+        self._reconnect_task = self._async_create_task(
+            self._async_reconnect_worker(), "reconnect"
+        )
+
+    async def _async_backoff(self, seconds: float) -> None:
+        """Sleep between reconnect attempts; a new advertisement ends it early.
+
+        News that arrived during the previous attempt is kept, so it skips this
+        backoff entirely.
+        """
+        with contextlib.suppress(TimeoutError):
+            async with asyncio.timeout(seconds):
+                await self._wake_event.wait()
+        self._wake_event.clear()
 
     async def _async_reconnect_worker(self) -> None:
         """Retry GATT connect while the Peak is advertising."""
@@ -683,11 +826,14 @@ class PuffcoDataUpdateCoordinator(ActiveBluetoothDataUpdateCoordinator[PuffcoDat
 
         last_err: Exception | None = None
         for attempt in range(1, RECONNECT_MAX_ATTEMPTS + 1):
-            device = self._pending_ble_device
-            if device is None:
-                device = bluetooth.async_ble_device_from_address(
+            # Prefer HA's current view: after a proxy reboot the cached
+            # BLEDevice points at the old scanner/connection.
+            device = (
+                bluetooth.async_ble_device_from_address(
                     self.hass, self.mac, connectable=True
                 )
+                or self._pending_ble_device
+            )
             if device is None:
                 _LOGGER.debug(
                     "%s reconnect attempt %s/%s: not visible yet",
@@ -696,7 +842,11 @@ class PuffcoDataUpdateCoordinator(ActiveBluetoothDataUpdateCoordinator[PuffcoDat
                     RECONNECT_MAX_ATTEMPTS,
                 )
                 if attempt < RECONNECT_MAX_ATTEMPTS:
-                    await asyncio.sleep(min(2 * attempt, 6))
+                    self._waiting_for_advert = True
+                    try:
+                        await self._async_backoff(min(2 * attempt, 6))
+                    finally:
+                        self._waiting_for_advert = False
                 continue
             previous_data = self.data
             try:
@@ -713,10 +863,11 @@ class PuffcoDataUpdateCoordinator(ActiveBluetoothDataUpdateCoordinator[PuffcoDat
                 )
                 self._needs_reconnect = True
                 self._ble_connected = False
-                async with self._lock:
-                    await self._client.disconnect()
+                with contextlib.suppress(BleOperationTimeout):
+                    async with self._ble_op("reconnect cleanup", LOCKED_GATT_TIMEOUT):
+                        await self._async_force_disconnect()
                 if attempt < RECONNECT_MAX_ATTEMPTS:
-                    await asyncio.sleep(min(2 * attempt, 6))
+                    await self._async_backoff(min(2 * attempt, 6))
                 continue
             self._pending_ble_device = None
             self._reconnect_failures = 0
@@ -769,7 +920,7 @@ class PuffcoDataUpdateCoordinator(ActiveBluetoothDataUpdateCoordinator[PuffcoDat
                 timedelta(seconds=RECONNECT_INTERVAL),
             )
         )
-        self.hass.async_create_task(self._async_initial_connect())
+        self._async_create_task(self._async_initial_connect(), "initial connect")
 
     async def _async_initial_connect(self) -> None:
         """Try to link after HA restart without blocking setup."""
@@ -805,7 +956,10 @@ class PuffcoDataUpdateCoordinator(ActiveBluetoothDataUpdateCoordinator[PuffcoDat
 
         @callback
         def _deferred(_now: datetime) -> None:
-            self.hass.async_create_task(self._async_run_full_refresh_safe())
+            if not self._shutting_down:
+                self._async_create_task(
+                    self._async_run_full_refresh_safe(), "full refresh"
+                )
 
         self.hass.async_call_later(self.hass, 3, _deferred)
 
@@ -834,7 +988,7 @@ class PuffcoDataUpdateCoordinator(ActiveBluetoothDataUpdateCoordinator[PuffcoDat
         if not self._ble_connected:
             return
         if self._should_idle_disconnect():
-            self.hass.async_create_task(self._async_idle_disconnect())
+            self._async_create_task(self._async_idle_disconnect(), "idle disconnect")
             return
         interval = self._poll_interval_seconds()
         if self._last_interval_poll is not None:
@@ -848,13 +1002,13 @@ class PuffcoDataUpdateCoordinator(ActiveBluetoothDataUpdateCoordinator[PuffcoDat
     def _schedule_interval_poll(self) -> None:
         if self._interval_poll_task is not None and not self._interval_poll_task.done():
             return
-        self._interval_poll_task = self.hass.async_create_task(
-            self._async_run_interval_poll()
+        self._interval_poll_task = self._async_create_task(
+            self._async_run_interval_poll(), "interval poll"
         )
 
     @callback
     def _async_reconnect_tick(self, _now) -> None:
-        if self.hass.is_stopping or self._write_in_progress:
+        if self.hass.is_stopping or self._shutting_down or self._write_in_progress:
             return
         if self._ble_connected and self._client.is_connected:
             return
@@ -921,7 +1075,7 @@ class PuffcoDataUpdateCoordinator(ActiveBluetoothDataUpdateCoordinator[PuffcoDat
         if self._write_in_progress:
             return
         try:
-            async with self._lock:
+            async with self._ble_op("post-write refresh", LOCKED_GATT_TIMEOUT):
                 if not self._client.is_connected:
                     return
                 self.data = await self._client.fetch_data_fast(
@@ -1027,7 +1181,7 @@ class PuffcoDataUpdateCoordinator(ActiveBluetoothDataUpdateCoordinator[PuffcoDat
     async def _async_fetch_data(
         self, device: BLEDevice | None, *, full: bool = True
     ) -> PuffcoData:
-        async with self._lock:
+        async with self._ble_op("fetch" if full else "fast poll"):
             resolved = (
                 bluetooth.async_ble_device_from_address(
                     self.hass, self.mac, connectable=True
@@ -1054,7 +1208,7 @@ class PuffcoDataUpdateCoordinator(ActiveBluetoothDataUpdateCoordinator[PuffcoDat
                     return self.data
                 self._ble_connected = False
                 self._needs_reconnect = True
-                await self._client.disconnect()
+                await self._async_force_disconnect()
                 raise err from err
             self._mark_online()
             return data
@@ -1071,12 +1225,18 @@ class PuffcoDataUpdateCoordinator(ActiveBluetoothDataUpdateCoordinator[PuffcoDat
             return
         self._ble_connected = False
         self._needs_reconnect = True
-        super()._async_handle_unavailable(service_info)
-        self.hass.async_create_task(self._async_drop_connection())
+        try:
+            super()._async_handle_unavailable(service_info)
+        finally:
+            if not self._shutting_down:
+                self._async_create_task(
+                    self._async_drop_connection(), "drop connection"
+                )
 
     async def _async_drop_connection(self) -> None:
-        async with self._lock:
-            await self._client.disconnect()
+        with contextlib.suppress(BleOperationTimeout):
+            async with self._ble_op("drop connection", LOCKED_GATT_TIMEOUT):
+                await self._async_force_disconnect()
 
     @callback
     def _async_handle_bluetooth_event(
@@ -1087,12 +1247,23 @@ class PuffcoDataUpdateCoordinator(ActiveBluetoothDataUpdateCoordinator[PuffcoDat
         self._ready_event.set()
         self._advertising = True
         self._touch_last_seen()
+        # "News" = first advert via a different scanner, or the first after a
+        # gap (the same proxy rebooted / regained Wi-Fi, the Peak woke up).
+        now = time.monotonic()
+        new_path = (
+            service_info.source != self._last_advert_source
+            or self._last_advert_at is None
+            or now - self._last_advert_at > ADVERT_GAP_IS_NEWS
+        )
+        self._last_advert_source = service_info.source
+        self._last_advert_at = now
         force = self._needs_reconnect or not self._client.is_connected
         if force:
             self._last_poll = None
+            # Schedule first: an exception further down (entity update) used
+            # to skip this, leaving the Peak advertising and never reconnected.
+            self._schedule_reconnect(service_info.device, wake=new_path)
         super()._async_handle_bluetooth_event(service_info, change)
-        if force:
-            self._schedule_reconnect(service_info.device)
 
     async def _async_wake_reconnect(self, device: BLEDevice) -> None:
         """Legacy entry point — routes through the reconnect worker."""
@@ -1115,7 +1286,7 @@ class PuffcoDataUpdateCoordinator(ActiveBluetoothDataUpdateCoordinator[PuffcoDat
                 await asyncio.sleep(SESSION_START_POLL_INTERVAL)
             previous = self.data
             try:
-                async with self._lock:
+                async with self._ble_op("post-start refresh"):
                     if not self._client.is_connected:
                         device = bluetooth.async_ble_device_from_address(
                             self.hass, self.mac, connectable=True
@@ -1140,7 +1311,7 @@ class PuffcoDataUpdateCoordinator(ActiveBluetoothDataUpdateCoordinator[PuffcoDat
         await self._async_preempt_ble_for_write()
         device = await self._async_resolve_ble_device()
         try:
-            async with self._lock:
+            async with self._ble_op("dock check"):
                 if device is not None:
                     self._client.set_ble_device(device)
                 if not self._client.is_connected:
@@ -1190,7 +1361,9 @@ class PuffcoDataUpdateCoordinator(ActiveBluetoothDataUpdateCoordinator[PuffcoDat
 
         await self.async_write(_write, refresh=False)
         self._optimistic_session_start()
-        self.hass.async_create_task(self._async_refresh_until_heat_state())
+        self._async_create_task(
+            self._async_refresh_until_heat_state(), "post-start refresh"
+        )
 
     async def async_abort_session(self) -> None:
         async def _write(client):
@@ -1231,7 +1404,7 @@ class PuffcoDataUpdateCoordinator(ActiveBluetoothDataUpdateCoordinator[PuffcoDat
         previous_data = self.data
         device = await self._async_resolve_ble_device()
         try:
-            async with self._lock:
+            async with self._ble_op("command"):
                 if device is None and not self._client.is_connected:
                     raise HomeAssistantError(
                         "Puffco is asleep or out of range — wake it (tap the "
@@ -1257,8 +1430,9 @@ class PuffcoDataUpdateCoordinator(ActiveBluetoothDataUpdateCoordinator[PuffcoDat
         finally:
             self._write_in_progress = False
         if refresh:
-            self.hass.async_create_task(
-                self._async_post_write_refresh(previous_data, profile_index)
+            self._async_create_task(
+                self._async_post_write_refresh(previous_data, profile_index),
+                "post-write refresh",
             )
 
     async def async_reconnect(self, *, clear_bond: bool = False) -> None:
@@ -1269,12 +1443,13 @@ class PuffcoDataUpdateCoordinator(ActiveBluetoothDataUpdateCoordinator[PuffcoDat
         self._reconnect_task = None
         self._needs_reconnect = True
         self._ble_connected = False
-        async with self._lock:
+        # Connect-sized budget: unpair() may scan for up to 15s first.
+        async with self._ble_op("manual reconnect", LOCKED_CONNECT_TIMEOUT):
             if clear_bond:
                 self._client.reset_bond_state()
                 with contextlib.suppress(Exception):
                     await self._client.unpair()
-            await self._client.disconnect()
+            await self._async_force_disconnect()
             device = bluetooth.async_ble_device_from_address(
                 self.hass, self.mac, connectable=True
             )
@@ -1294,16 +1469,28 @@ class PuffcoDataUpdateCoordinator(ActiveBluetoothDataUpdateCoordinator[PuffcoDat
             )
 
     async def async_shutdown(self) -> None:
+        """Tear down for unload. Bounded and never raises.
+
+        A raise here fails ``async_unload_entry`` and strands the entry in
+        ``failed_unload`` until HA restarts — which is what an ESPHome
+        disconnect timing out ("Timeout waiting for
+        BluetoothDeviceConnectionResponse after 20.0s") used to do.
+        """
+        self._shutting_down = True
         self._stop_session_timer()
-        for task in (
-            self._reconnect_task,
-            self._interval_poll_task,
-        ):
-            if task is not None and not task.done():
-                task.cancel()
-                with contextlib.suppress(asyncio.CancelledError):
-                    await task
+        tasks = [
+            task
+            for task in (self._reconnect_task, self._interval_poll_task)
+            if task is not None and not task.done()
+        ]
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            # Entry background tasks are also cancelled by HA after unload;
+            # this just lets ours finish first, without waiting forever.
+            await asyncio.wait(tasks, timeout=SHUTDOWN_TIMEOUT / 2)
         self._reconnect_task = None
         self._interval_poll_task = None
-        await self._client.disconnect()
-        self._async_stop()
+        await self._async_force_disconnect()
+        with contextlib.suppress(Exception):
+            self._async_stop()
