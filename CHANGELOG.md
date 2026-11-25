@@ -2,6 +2,31 @@
 
 Upstream history (HA-Puff/home-assistant-puffco up to 1.1.24) is in docs/UPSTREAM-CHANGELOG.md.
 
+## [Unreleased] — auto-reconnect
+
+### Fixed
+
+- **Reconnect after a proxy reboot / Peak wake without reloading the entry.** The lantern light read
+  `PuffcoClient.bleak` while disconnected and raised `RuntimeError: Not connected` inside the Bluetooth
+  advertisement, unavailable and disconnect callbacks, aborting them before they scheduled a reconnect
+  (1,259 "Error in bluetooth callback" entries on the live install). The light now reads the colour only with a
+  live session, the coordinator isolates entity update errors, and reconnects are scheduled before entities
+  are touched.
+- **A hung GATT op can no longer wedge the BLE lock.** Lorax short reads waited on a reply notification with no
+  timeout; a proxy dying mid-read held the coordinator lock forever, stalling the reconnect worker and the
+  Reconnect button. Reads now time out (and fail fast when the link is down), and every locked operation runs
+  under a budget (150 s with a connect, 45 s otherwise) that force-drops the link and releases the lock.
+- **Unload can no longer end in `failed_unload`.** Coordinator teardown is bounded and never raises (an ESPHome
+  disconnect timing out after 20 s used to fail the unload); `PuffcoClient.disconnect()` drops its reference even
+  when the backend errors. Coordinator tasks are entry background tasks, cancelled on unload.
+- A fresh advertisement (new proxy, or the first after a 20 s gap) cuts a running reconnect worker's backoff
+  short; the worker prefers HA's current `BLEDevice` over the one cached before a proxy reboot.
+
+### Added
+
+- `tests/` — hang/reconnect unit tests (`pip install -r tests/requirements.txt && pytest tests`).
+- `docs/peak_bridge_watchdog.automation.json` — watchdog covering both the ATOM bridge and the watch.
+
 ## [1.2.0] - 2026-10-11 — PEAKHAUS
 
 First packaged release: integration + ESPHome Bluetooth bridge + M5Dial remote + dashboard page in one repo.

@@ -1,0 +1,85 @@
+{
+  "id": "peak_bridge_watchdog",
+  "alias": "Peak: bridge watchdog",
+  "description": "Backstop only: the integration now reconnects by itself (auto-reconnect branch). Reloads the Puffco entry when the Peak is awake and advertising but has not been linked for 10 min, or its data is unavailable for 5 min, while at least one BLE proxy (ATOM puffco-bridge or the puffco-watch) is online. Also re-checks 2 min after either proxy comes back. Max once per 30 min; notifies Joe if it had to reload twice within an hour.",
+  "mode": "single",
+  "trigger": [
+    {
+      "platform": "state",
+      "entity_id": "binary_sensor.peak_pro_02743_connected",
+      "to": "off",
+      "for": { "minutes": 10 },
+      "id": "peak_unlinked"
+    },
+    {
+      "platform": "state",
+      "entity_id": "sensor.peak_pro_02743_battery",
+      "to": "unavailable",
+      "for": { "minutes": 5 },
+      "id": "peak_unavailable"
+    },
+    {
+      "platform": "state",
+      "entity_id": "binary_sensor.puffco_bridge_status",
+      "to": "on",
+      "for": { "minutes": 2 },
+      "id": "atom_back"
+    },
+    {
+      "platform": "state",
+      "entity_id": "sensor.puffco_watch_wifi_signal",
+      "from": "unavailable",
+      "for": { "minutes": 2 },
+      "id": "watch_back"
+    }
+  ],
+  "condition": [
+    {
+      "condition": "or",
+      "conditions": [
+        {
+          "condition": "state",
+          "entity_id": "binary_sensor.puffco_bridge_status",
+          "state": "on"
+        },
+        {
+          "condition": "template",
+          "value_template": "{{ states('sensor.puffco_watch_wifi_signal') not in ['unavailable', 'unknown'] }}"
+        }
+      ]
+    },
+    {
+      "condition": "template",
+      "value_template": "{{ is_state('sensor.peak_pro_02743_battery', 'unavailable') or (is_state('binary_sensor.peak_pro_02743_connected', 'off') and is_state('binary_sensor.peak_pro_02743_advertising', 'on') and (now() - states.binary_sensor.peak_pro_02743_connected.last_changed) > timedelta(minutes=2)) }}"
+    },
+    {
+      "condition": "template",
+      "value_template": "{{ this.attributes.last_triggered is none or (now() - this.attributes.last_triggered) > timedelta(minutes=30) }}"
+    }
+  ],
+  "action": [
+    {
+      "variables": {
+        "recent": "{{ this.attributes.last_triggered is not none and (now() - this.attributes.last_triggered) < timedelta(hours=1) }}"
+      }
+    },
+    {
+      "service": "homeassistant.reload_config_entry",
+      "data": { "entry_id": "01M44P9F8SGNZ3XZF4EP4REPXY" }
+    },
+    {
+      "if": [
+        { "condition": "template", "value_template": "{{ recent }}" }
+      ],
+      "then": [
+        {
+          "service": "notify.mobile_app_put_it_here",
+          "data": {
+            "title": "Peak keeps dropping",
+            "message": "Reloaded the Puffco integration twice within an hour ({{ trigger.id }}). Check the bridge/watch and the Peak."
+          }
+        }
+      ]
+    }
+  ]
+}

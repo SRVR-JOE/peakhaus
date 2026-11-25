@@ -79,6 +79,20 @@ RECONNECT_INTERVAL = 15
 RECONNECT_WAKE_DELAY = 1.0
 RECONNECT_WAKE_DELAY_ADVERTISING = 0.2
 RECONNECT_MAX_ATTEMPTS = 8
+# Hard ceilings on work done while holding the coordinator BLE lock. A GATT op
+# that outlives its budget is treated as a dead link: the session is torn down
+# and the lock released so reconnects and the Reconnect button never wedge.
+# Connect (bleak-retry-connector retries + up to three handshake heals) is the
+# slow path; reads/writes on an established session are much faster.
+LOCKED_CONNECT_TIMEOUT = 150.0
+LOCKED_GATT_TIMEOUT = 45.0
+# How long a caller waits for the lock before giving up (> the longest holder).
+LOCK_ACQUIRE_TIMEOUT = LOCKED_CONNECT_TIMEOUT + 15.0
+# Bound on a single backend disconnect (an ESPHome proxy that vanished times
+# out after ~20s inside aioesphomeapi).
+DISCONNECT_TIMEOUT = 10.0
+# Bound on coordinator teardown during config-entry unload.
+SHUTDOWN_TIMEOUT = 20.0
 # Wait for the Peak to advertise before failing a user command (asleep / out of range).
 WAKE_ON_COMMAND_TIMEOUT = 5.0
 WAKE_ON_COMMAND_POLL = 0.3

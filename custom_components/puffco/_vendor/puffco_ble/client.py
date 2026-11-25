@@ -546,10 +546,13 @@ class PuffcoClient:
         return await self._reset_os_bond(client)
 
     async def disconnect(self) -> None:
-        if self._client and self._client.is_connected:
-            await self._client.disconnect()
-        self._client = None
+        # Always drop our reference, even when the backend disconnect raises or
+        # is cancelled (an ESPHome proxy that vanished mid-session times out
+        # here); otherwise is_connected / bleak keep pointing at a dead client.
+        client, self._client = self._client, None
         self._connected_once = False
+        if client is not None and client.is_connected:
+            await client.disconnect()
 
     async def ensure_connected(self) -> None:
         if not self.is_connected:
